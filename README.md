@@ -81,6 +81,7 @@ What the tests in this repository used, and a good starting point:
 - `CFGGuider` cfg 3, sampler `er_sde`, scheduler `simple`, 25 steps. Shift 5 is set by the model automatically.
 - Max tile `0` (auto = 1024, about 1 MP per tile, within MOSS's 1-2 MP sweet spot), `context_anchor` 32, `context_overlap` 32.
 - Denoise 0.45 -> 0.22 for a 2-3 step upscale.
+- The positive prompt reaches every tile. Objects it names (say "seagulls") get drawn into any tile with a vaguely matching shape, more so at higher denoise. For upscaling, prefer a prompt that describes the style, medium and lighting rather than the objects, or lower the denoise (0.35 -> 0.18 cut the colour drift of the 3-step test by a fifth).
 - Do not start ComfyUI with `--use-sage-attention`: it produces broken images with MOSS-Image.
 - MOSS's own guide advises against latent upscaling. These nodes enlarge in pixel space and re-encode, as recommended.
 
