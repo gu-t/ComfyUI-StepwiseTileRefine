@@ -86,6 +86,23 @@ What the tests in this repository used, and a good starting point:
 
 On an RTX 4090 one 1 MP tile takes about 5 s at 25 steps (int8 model, cfg 3).
 
+### Measured with MOSS-Image
+
+Same seed, prompt, sampler and denoise per step, against Ultimate SD Upscale (custom sample, lanczos, tile 1024 + padding 64, chained once per step). Harness: [tests-moss/](tests-moss/).
+
+| Case | Steps | Tiles | Time | Final size | USDU final size | USDU time |
+|---|---|---|---|---|---|---|
+| 1280x960 x3 | 1 | 20 | 100 s | 3840x2880 | 3840x2880 | 98 s |
+| 1280x960 x3 | 3 | 33 | 163 s | 3840x2880 | 3840x**2888** | 177 s |
+| 1280x976 x3 | 3 | 33 | 167 s | 3840x2928 | 3840x2928 | 177 s |
+| 2000x2000 x2 | 2 (auto) | 41 | 205 s | 4000x4000 | **4008x4008** | 203 s |
+| 1344x768 x2 | 2 (auto) | 10 | 50 s | 2688x1536 | **2696**x1536 | 80 s |
+
+- The final size was exact in every case. USDU missed it in three of five (stretched to a multiple of 8 after each pass).
+- No seam line stood out from the image's own edges in any output (`tests-moss/analyze.py` ranks every row and column against its neighbourhood).
+- MOSS img2img brightens slightly at these denoise values (+1 to +6 /255 over a 2-3 step chain). USDU shows the same shift, so it comes from the model, not the tiling.
+- A faint 16 px pattern on the latent grid is a property of the FLUX.2 VAE and MOSS, not of the tiles: at x1.5 / denoise 0.45 the grid-periodicity score was 1.028 for lanczos only, 1.042 after a plain VAE round trip, 1.066 for one untiled whole-image MOSS pass, and 1.049 for this node's tiled pass. USDU scores lower because it resamples every tile, which blurs that pattern along with the detail.
+
 ## Other models
 
 Nothing model-specific is hard-coded. Everything that depends on the model or the VAE has an automatic default that can be overridden:

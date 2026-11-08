@@ -77,6 +77,7 @@ ignore = [
 # The A/B harness is a console tool, excluded from the registry archive by
 # .comfyignore; printing is its interface.
 "tests-AB/*" = ["T201"]
+"tests-moss/*" = ["T201", "C408", "SIM115"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
