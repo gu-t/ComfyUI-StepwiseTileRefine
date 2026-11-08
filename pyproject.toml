@@ -1,29 +1,32 @@
 [project]
-name = "contextanchoredtilerefine"
-description = "Seamless tiled refinement and upscaling. Refine an image tile by tile with no visible seams, or refine only a masked region of a large image without processing the rest. Each tile is conditioned on its already-refined neighbors held as frozen context. The VL nodes (Krea 2) need no prompt at all: each tile's conditioning is vision tokens of its own crop plus its slice of a vision encode of the entire image, so prompt objects never reappear in the wrong tile. Works with any guider, including NAG (Normalized Attention Guidance)."
-version = "1.9.0"
+name = "comfyui-stepwisetilerefine"
+description = "Stepwise tiled upscaling for any VAE latent scale (8x, 16x FLUX.2 / MOSS-Image, ...). A fork of Context-Anchored Tile Refine: exact final size, evenly split tiles that are never resampled, and a multi-step upscale node that plans its own steps."
+version = "0.1.0"
 license = { file = "LICENSE" }
 requires-python = ">=3.12"
-dependencies = ["logit-classifier>=0.5.0"]
+dependencies = []
 classifiers = [
     "Operating System :: OS Independent",
     "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
 ]
 
 [project.optional-dependencies]
+# logit-classifier is only needed by the upstream VL code and its tests, which this fork keeps
+# but does not register as nodes.
 test = [
     "pytest>=9.0.0",
     "pytest-cov>=7.0.0",
     "ruff==0.16.2",
+    "logit-classifier>=0.5.0",
 ]
 
 [project.urls]
-Repository = "https://github.com/Blakeem/ComfyUI-ContextAnchoredTileRefine"
-"Bug Tracker" = "https://github.com/Blakeem/ComfyUI-ContextAnchoredTileRefine/issues"
+Repository = "https://github.com/gu-t/ComfyUI-StepwiseTileRefine"
+"Bug Tracker" = "https://github.com/gu-t/ComfyUI-StepwiseTileRefine/issues"
+Upstream = "https://github.com/Blakeem/ComfyUI-ContextAnchoredTileRefine"
 
 [tool.comfy]
-PublisherId = "blake"
-DisplayName = "Context-Anchored Tile Refine"
+DisplayName = "Stepwise Tile Refine"
 Icon = ""
 requires-comfyui = ">=0.3.45"
 

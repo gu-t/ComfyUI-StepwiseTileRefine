@@ -1,300 +1,128 @@
-# Context-Anchored Tile Refine
+# Stepwise Tile Refine
 
-ComfyUI nodes for tiled refining and upscaling. An already upscaled image is refined a tile at a time with no visible seams. On the VL nodes, a global prompt is replaced by vision conditioning.
+ComfyUI nodes for tiled upscaling that work with **any VAE latent scale**, including the 16x FLUX.2 VAE that **MOSS-Image** uses, and a node that upscales in **several steps** and plans those steps itself.
 
-Sample results from Krea 2 and the Tile Upscale (VL) node. Each image was upscaled in two passes. Click to view the full-sized image.
-
-<table>
-<tr>
-<td align="center"><a href="samples/cyberpunks-couple.webp"><img src="samples/cyberpunks-couple.webp" alt="Cyberpunks couple, original" width="100%"></a><br><sub>v1.8.0, Original, 1024x576</sub></td>
-<td align="center"><a href="samples/cyberpunks-couple-4k.webp"><img src="samples/cyberpunks-couple-4k-preview.jpg" alt="Cyberpunks couple, 4x Tile Upscale (VL)" width="100%"></a><br><sub>4x, denoise 0.35, 6 tiles, 4096x2304</sub></td>
-<td align="center"><a href="samples/cyberpunks-couple-8k.webp"><img src="samples/cyberpunks-couple-8k-preview.jpg" alt="Cyberpunks couple, 8K Tile Upscale (VL)" width="100%"></a><br><sub>then 2x, denoise 0.35, 24 tiles, 8192x4608</sub></td>
-</tr>
-<tr>
-<td align="center"><a href="samples/dark-city.webp"><img src="samples/dark-city.webp" alt="Dark city, original" width="100%"></a><br><sub>v1.8.0, Original, 1024x576</sub></td>
-<td align="center"><a href="samples/dark-city-4k.webp"><img src="samples/dark-city-4k-preview.jpg" alt="Dark city, 4x Tile Upscale (VL)" width="100%"></a><br><sub>4x, denoise 0.35, 6 tiles, 4096x2304</sub></td>
-<td align="center"><a href="samples/dark-city-8k.webp"><img src="samples/dark-city-8k-preview.jpg" alt="Dark city, 8K Tile Upscale (VL)" width="100%"></a><br><sub>then 2x, denoise 0.35, 24 tiles, 8192x4608</sub></td>
-</tr>
-<tr>
-<td align="center"><a href="samples/cyberpunk-city.webp"><img src="samples/cyberpunk-city.webp" alt="Cyberpunk city, original" width="100%"></a><br><sub>v1.6.0, Original, 1024x576</sub></td>
-<td align="center"><a href="samples/cyberpunk-city-4k.webp"><img src="samples/cyberpunk-city-4k-preview.jpg" alt="Cyberpunk city, 4x Tile Upscale (VL)" width="100%"></a><br><sub>4x, denoise 0.5, 6 tiles, 4096x2304</sub></td>
-<td align="center"><a href="samples/cyberpunk-city-8k.webp"><img src="samples/cyberpunk-city-8k-preview.jpg" alt="Cyberpunk city, 8K Tile Upscale (VL)" width="100%"></a><br><sub>then 2x, denoise 0.35, 30 tiles, 8192x4608</sub></td>
-</tr>
-<tr>
-<td align="center"><a href="samples/orbital-shipyard-hangar.webp"><img src="samples/orbital-shipyard-hangar.webp" alt="Orbital shipyard hangar, original" width="100%"></a><br><sub>v1.6.0, Original, 1024x576</sub></td>
-<td align="center"><a href="samples/orbital-shipyard-hangar-4k.webp"><img src="samples/orbital-shipyard-hangar-4k-preview.jpg" alt="Orbital shipyard hangar, 4x Tile Upscale (VL)" width="100%"></a><br><sub>4x, denoise 0.5, 6 tiles, 4096x2304</sub></td>
-<td align="center"><a href="samples/orbital-shipyard-hangar-8k.webp"><img src="samples/orbital-shipyard-hangar-8k-preview.jpg" alt="Orbital shipyard hangar, 8K Tile Upscale (VL)" width="100%"></a><br><sub>then 2x, denoise 0.35, 30 tiles, 8192x4608</sub></td>
-</tr>
-</table>
+> **Fork notice.** This is a fork of [Blakeem/ComfyUI-ContextAnchoredTileRefine](https://github.com/Blakeem/ComfyUI-ContextAnchoredTileRefine) (GPL-3.0). The tile engine (context rings, shared noise, directional feather, minimum-error seam cut, DC match) is upstream's work. What this fork changes is listed [below](#what-the-fork-changes). The upstream README is kept in [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md).
+>
+> The fork is maintained when time allows and comes with no support commitment.
 
 ## Contents
 
 - [Installation](#installation)
 - [The nodes](#the-nodes)
-  - [Tile Refine](#tile-refine)
-  - [VL nodes](#vl-nodes)
-    - [Tile Refine (VL)](#tile-refine-vl)
-    - [Tile Upscale (VL)](#tile-upscale-vl)
-    - [Supported samplers](#supported-samplers)
-- [Node Inputs and Parameters](#node-inputs-and-parameters)
-- [Features](#features)
-  - [Tiling geometry](#tiling-geometry)
-  - [Seams on the base node](#seams-on-the-base-node)
-  - [Seams on the VL nodes](#seams-on-the-vl-nodes)
-  - [Conditioning on the VL nodes](#conditioning-on-the-vl-nodes)
-  - [Regions, batches, and control](#regions-batches-and-control)
-- [Settings file](#settings-file)
-- [Test nodes](#test-nodes)
+  - [Stepwise Tile Upscale](#stepwise-tile-upscale)
+  - [Tile Refine (Any VAE)](#tile-refine-any-vae)
+- [How the steps are planned](#how-the-steps-are-planned)
+- [MOSS-Image settings](#moss-image-settings)
+- [Other models](#other-models)
+- [What the fork changes](#what-the-fork-changes)
+- [Known limitations](#known-limitations)
+- [Tests](#tests)
 - [License](#license)
 
 ## Installation
 
-The pack needs Python 3.12 or newer. Search for "Context-Anchored Tile Refine" in ComfyUI Manager, or clone into your `custom_nodes` folder:
+Clone into your ComfyUI `custom_nodes` folder and restart ComfyUI:
 
 ```
-git clone https://github.com/blakeem/ComfyUI-ContextAnchoredTileRefine
+git clone https://github.com/gu-t/ComfyUI-StepwiseTileRefine
 ```
 
-A clone also needs the one Python dependency, [logit-classifier](https://pypi.org/project/logit-classifier/). ComfyUI Manager installs it for you. After a clone, run this in ComfyUI's Python environment from the node's folder:
-
-```
-pip install -r requirements.txt
-```
+The nodes need nothing beyond ComfyUI itself (Python 3.12+). The package uses its own class names and the category `image/upscaling/stepwise`, so it can be installed next to the original Context-Anchored Tile Refine.
 
 ## The nodes
 
-The example workflows linked below sit in the `workflows` folder, and ComfyUI lists them in its template browser. Some of them use third-party nodes. They load the author's own model, LoRA and upscale model files, so point each loader at your own files.
+Both nodes are wired like `SamplerCustomAdvanced`: a `GUIDER` (for example `CFGGuider`), a `SAMPLER` (`KSamplerSelect`), a `NOISE` (`RandomNoise`) and the `VAE`.
 
-### Tile Refine
+### Stepwise Tile Upscale
 
-![Context-Anchored Tile Refine](refine-node.png)
+Upscales in several steps. Each step enlarges the whole image in pixel space and then refines it tile by tile, with the denoise falling from the first step to the last.
 
-The base node works with most diffusion models. Upscale the image first and feed it in. The sampling inputs are wired as for SamplerCustomAdvanced. Since the image is already upscaled, a mask is supported.
+| Input | What it does |
+|---|---|
+| `image`, `guider`, `sampler`, `noise`, `vae` | As for `SamplerCustomAdvanced`. The VAE's latent scale is read automatically. |
+| `scheduler`, `steps` | Each step's sigmas are built like `BasicScheduler` with that step's denoise. |
+| `upscale_by` | Total enlargement. The final size is `round(input × upscale_by)` on each axis, exactly. |
+| `upscale_steps` | Number of enlarge + refine steps. `0` picks the fewest steps whose factor stays at or under `auto_step_factor` (1.5), e.g. 2 steps for x2 and 3 for x3. |
+| `max_tile_width` / `max_tile_height` | Largest size the model sees per tile, rings included. `0` picks 1024 for SDXL/Flux/MOSS-class models and 768 for SD1.x/2.x. |
+| `context_anchor` / `context_overlap` | Minimum ring widths (frozen context, and the band shared and blended between neighbours). They are rounded up to whole latent cells and the pixel grid. |
+| `denoise_first` / `denoise_last` | Denoise of the first and the last step. The steps in between are interpolated linearly. |
+| `plan_only` | Computes and outputs the plan without sampling, so you can check it before a long run. |
+| `upscale_model` (optional) | Used for the first step only, then lanczos to that step's exact size. Later steps use lanczos, so a 4x model never runs on a large intermediate. |
+| `aspect_tolerance` (advanced) | How much aspect-ratio deviation (percent) an intermediate step may take to get tiles of equal size. `0` keeps the closest exact enlargement. The final step is always exact. |
+| `auto_step_factor`, `latent_scale`, `pixel_multiple` (advanced) | See [How the steps are planned](#how-the-steps-are-planned) and [Other models](#other-models). |
 
-Example workflow: [Chroma + Z-Image hybrid](workflows/Chroma%20+%20z-image%20Hybrid%20workflow.json)
+Outputs: the final `image`, `step_images` (the result of every step, as a list since the sizes differ) and `plan`, a Markdown table that is also written to the log. Connect `plan` to *Preview as Text* in Markdown mode.
 
-### VL nodes
+Example plan, MOSS-Image, 1280x960 x3 in 3 steps:
 
-The VL nodes were built for and tested with Krea 2. Other Qwen3-VL based models, including Krea 2 Turbo, are untested.
+| Step | Size | Factor x / y | Aspect dev | Tiles | Core px (w x h) | Sampled px (w x h) | Denoise | Enlarge | Size choice |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 1280x960 -> 1824x1376 | 1.425 / 1.433 | -0.58% | 2x2 = 4 | 912 x 688 | 976 x 752 | 0.450 | lanczos | even tiles |
+| 2 | 1824x1376 -> 2688x2016 | 1.474 / 1.465 | +0.00% | 3x3 = 9 | 896 x 672 | 1024/960 x 800/736 | 0.335 | lanczos | even tiles |
+| 3 | 2688x2016 -> 3840x2880 | 1.429 / 1.429 | +0.00% | 5x4 = 20 | 768 x 720 | 896/832 x 848/784 | 0.220 | lanczos | final (exact) |
 
-Both nodes take `clip`, `anchor_source`, `vlm_method` and `prompt`. `clip` is the Qwen3-VL text encoder Krea 2 uses, such as `qwen3vl_4b_fp8_scaled.safetensors` in `models/text_encoders`. Load it with Load CLIP set to type `krea2`. Encoders without a vision path (SD/SDXL CLIP, T5, plain Qwen3) are rejected with a clear error. Connect the positive prompt's text to `prompt` so that each tile can confirm the things the prompt names (see [Tile tags](#tile-tags)).
+### Tile Refine (Any VAE)
 
-#### Tile Refine (VL)
+Upstream's base node (*Context-Anchored Tile Refine*) with the latent scale read from the VAE instead of assumed to be 8. Upscale the image first and feed it in; denoise is set through the sigmas (`BasicScheduler`'s `denoise`). An optional `mask` refines only the masked region. On an 8x VAE it gives byte-identical output to the upstream node.
 
-![Context-Anchored Tile Refine (VL)](vl-refine-node.png)
+## How the steps are planned
 
-Tile Refine (VL) takes the same wiring as the base node. The guider's positive prompt is ignored, since each tile's conditioning is built from the image itself. Its negative still applies. A `mask` is supported and keeps the global view (see [Masked refine](#masked-refine)).
+1. The final size is `round(source × factor)`. There is no rounding to 64 and no stretch.
+2. Each step enlarges by about `factor^(1/steps)`. The intermediate sizes are a trade-off between an even factor per step, the right aspect ratio, and sizes where each axis splits into a whole number of **equal** tiles whose cores and sampled crops are multiples of the pixel grid and fit under the tile cap. Within `aspect_tolerance` the planner picks such a size. Otherwise it takes a grid-multiple size, and with tolerance 0 the closest exact enlargement (reflect-padded to the grid and cropped back, so the last tile of an axis can be narrower). The plan shows the factor and the aspect deviation of every step.
+3. Tiles are never resampled. A tile is cut from the canvas, sampled and pasted back at its native size.
+4. Denoise goes linearly from `denoise_first` to `denoise_last`, applied through the sigmas like `BasicScheduler`.
 
-Example workflow: [Krea 2 refine](workflows/Krea%202%20%28refine%29.json)
+## MOSS-Image settings
 
-#### Tile Upscale (VL)
+What the tests in this repository used, and a good starting point:
 
-![Context-Anchored Tile Upscale (VL)](vl-upscale-node.png)
+- Diffusion model: `moss_image_sft_int8_convrot` (Load Diffusion Model), text encoder `qwen3.5_9b_w4a8_gptq` (Load CLIP, type `moss_image`), VAE `flux2-vae`.
+- `CFGGuider` cfg 3, sampler `er_sde`, scheduler `simple`, 25 steps. Shift 5 is set by the model automatically.
+- Max tile `0` (auto = 1024, about 1 MP per tile, within MOSS's 1-2 MP sweet spot), `context_anchor` 32, `context_overlap` 32.
+- Denoise 0.45 -> 0.22 for a 2-3 step upscale.
+- Do not start ComfyUI with `--use-sage-attention`: it produces broken images with MOSS-Image.
+- MOSS's own guide advises against latent upscaling. These nodes enlarge in pixel space and re-encode, as recommended.
 
-Tile Upscale (VL) upscales and refines in one node. The image is upscaled first, through the optional `upscale_model` when connected, and a single lanczos pass brings it to `input size x upscale_by`. It then runs the same tile refine as Tile Refine (VL). Widgets replace the sampling inputs, and the optional `negative` still applies.
+On an RTX 4090 one 1 MP tile takes about 5 s at 25 steps (int8 model, cfg 3).
 
-Example workflow: [Krea 2 8K upscale](workflows/Krea%202%208k%20upscale.json) (the two-pass 4x then 2x chain the v1.8.0 sample images were made with)
+## Other models
 
-#### Supported samplers
+Nothing model-specific is hard-coded. Everything that depends on the model or the VAE has an automatic default that can be overridden:
 
-The VL nodes step every tile against one schedule, so they must time each sampler's model evaluations. The supported samplers are `euler`, `heun`, `dpm_2`, `dpmpp_2m`, `dpmpp_2m_sde` (all variants), `exp_heun_2_x0`, and `exp_heun_2_x0_sde`. Anything else is rejected before sampling starts. `dpm_fast`, `dpm_adaptive`, and `uni_pc` run their own schedule and cannot be supported. The base node accepts every sampler.
-
-## Node Inputs and Parameters
-
-| Input | Nodes | What it does |
+| Value | Default | Override |
 |---|---|---|
-| [`max_tile_width` / `max_tile_height`](#dynamic-tile-layout) | all | Largest pixel size the model sees per tile, context rings included. Set to the largest size your model handles well. |
-| [`context_anchor`](#context-rings) | all | Width of the context ring each tile conditions on. The ring holds neighboring tiles together and a masked region to its surroundings. |
-| [`context_overlap`](#context-rings) | all | Width of the band neighboring tiles share. 0 gives hard seams. Smooth gradients need more and detailed scenes need less. |
-| [`anchor_source`](#anchor-source) | VL | The context ring shows either the unmodified input for maximum fidelity, or the in-progress result so that flawed content can be repaired. |
-| [`vlm_method`](#conditioning-on-the-vl-nodes) | VL | What the model is told about each tile. Adding captions repairs flawed content during upscale. |
-| [`prompt`](#tile-tags) | VL | The prompt the image was made from. The VL model reads it to name each tile's contents, and the diffusion model never reads it. |
-| [`mask`](#masked-refine) | Refine, Refine (VL) | Refines only the masked region and leaves everything outside it untouched. An inverted mask on a second pass refines the rest with other settings. |
-| `clip` | VL | The vision-language encoder that builds all tile conditioning. |
-
-Preview any layout with the [tile simulator](https://blakeem.github.io/ComfyUI-ContextAnchoredTileRefine/tile-simulator.html).
-
-## Features
-
-| Feature | Tile Refine | Tile Refine (VL) | Tile Upscale (VL) |
-|---|:-:|:-:|:-:|
-| [Dynamic tile layout](#dynamic-tile-layout) | ✓ | ✓ | ✓ |
-| [Context rings](#context-rings) | ✓ | ✓ | ✓ |
-| [Shared noise](#shared-noise) | ✓ | ✓ | ✓ |
-| [Anchor conditioning](#anchor-conditioning) | ✓ | | |
-| [Directional feather](#directional-feather) | ✓ | ✓ | ✓ |
-| [Minimum error boundary cut](#minimum-error-boundary-cut) | ✓ | | |
-| [Brightness and color match](#brightness-and-color-match) | ✓ | | |
-| [Synchronized latent tiling](#synchronized-latent-tiling) | | ✓ | ✓ |
-| [Anchor source](#anchor-source) | | ✓ | ✓ |
-| [Vision tokens](#vision-tokens) | | ✓ | ✓ |
-| [Captions](#captions) | | ✓ | ✓ |
-| [Vision tokens and captions](#vision-tokens-and-captions) | | ✓ | ✓ |
-| [Tile tags](#tile-tags) | | ✓ | ✓ |
-| [Masked refine](#masked-refine) | ✓ | ✓ | |
-| [Batches](#batches) | ✓ | ✓ | ✓ |
-| [Guider input](#guider-and-controlnet) | ✓ | ✓ | |
-| [ControlNet](#guider-and-controlnet) | ✓ | | |
-
-### Tiling geometry
-
-#### Dynamic tile layout
-
-The grid is solved from the image size and `max_tile_width` / `max_tile_height`. Every crop is aligned to an 8 pixel boundary. Tiles are extracted, sampled, and pasted back at their native pixel size, so no quality is lost to resizing.
-
-#### Context rings
-
-Each tile is sampled with two extra rings that are cropped away after. `context_overlap` is the band shared with the neighboring tiles. `context_anchor` is pure context beyond that. The tile conditions on the anchor ring, so it continues its neighbors instead of drifting away from them. On the VL nodes, [`anchor_source`](#anchor-source) picks what the ring shows.
-
-#### Shared noise
-
-Each tile starts from its part of one noise pattern over the entire image. Samplers such as `dpmpp_2m_sde` add fresh noise at every step, and each step's noise comes from one pattern in the same way. This way both tiles that diffuse a shared band add the same noise there, so the feather blends two similar textures. On the base node, a sampler draws its step noise per tile when its draws cannot follow the shared pattern. `dpmpp_sde` (both variants) is one, since its draws within a step depend on each other. The `SamplerDPMAdaptative` node with `eta` above 0 is another, since its step count adapts to each tile's content. A sampler that makes its own draws also draws per tile, such as the `SamplerLCMUpscale` node or a sampler implemented in another node pack.
-
-### Seams on the base node
-
-The base node refines tiles one after another in raster order, so a tile's top and left neighbors are finished before it is sampled. Seams are hidden by conditioning first and then a narrow blend.
-
-#### Anchor conditioning
-
-The anchor ring shows each tile its already refined neighbors and holds that content frozen. This is the main seam mechanism, and the blending below only smooths the small differences left in the band.
-
-#### Directional feather
-
-Both tiles diffuse the shared band from the same raw pixels and the results are cross dissolved. The first 10 percent of the band stays with the new tile, then a squared ramp fades it to zero so that the two tiles connect at zero slope. A linear ramp meets the neighbor at an angle and appears as a visible line.
-
-#### Minimum error boundary cut
-
-Dynamic programming finds the path through the overlap band where the two refinements already agree, from Efros and Freeman, *Image Quilting for Texture Synthesis and Transfer* (SIGGRAPH 2001). The paper makes a hard cut on that path. With our method, the feather's midpoint bends along it, so the blend follows image content rather than a straight line.
-
-#### Brightness and color match
-
-Tiles diffused separately land at slightly different brightness and color levels. The fix is an additive, per channel, and sequential variant of gain compensation from Brown and Lowe, *Automatic Panoramic Image Stitching* (IJCV 2007). The shared band is the only place both tiles refined the same raw pixels, so the median of the difference there comes from the color shift and not from the content. Subtracting that median puts each tile on its neighbor's level. It runs only at tile seams, not at mask edges.
-
-### Seams on the VL nodes
-
-The VL nodes diffuse every tile together, so there is nothing to correct afterwards.
-
-#### Synchronized latent tiling
-
-The entire image is within one shared canvas latent and every tile is diffused one step at a time. Between steps the tiles are consolidated back into that canvas, with the overlap bands cross dissolved by the same [directional feather](#directional-feather) in latent space. This requires no boundary cut or color match.
-
-MultiDiffusion (Bar-Tal et al., ICML 2023) and Mixture of Diffusers (Jiménez, 2023) also process tiles at every step. Those methods overlap tiles and use an average of the two predictions, so where the tiles disagree the result is a soft image. With our method, the tiles are joined together at the boundary so that the tile body is direct model output. Only the thin band is predicted twice, and the feather blends the seam toward the later tile. The anchor ring is context that the tiles use to be aware of their surroundings. Those methods fuse inside one sampler pass over the entire canvas. With ours, each tile runs its own sampler and all the tiles are held to the same step.
-
-#### Anchor source
-
-`source image` (default) shows the ring the unmodified input. This keeps placement, style, and objects locked to the input, including its flaws. The `live canvas` shows the ring the neighbors' in-progress result instead, so the refine can repair flawed content. Expect more invention and slightly brighter output.
-
-### Conditioning on the VL nodes
-
-A global prompt describes the entire image while each tile holds only part of it. The diffusion model then recreates prompt objects inside tiles that should not contain them. The VL nodes replace the prompt with conditioning that is true for each tile, built by the same Qwen3-VL encoder wired to `clip`. Two operations are involved. One encodes the image into vision tokens. The other writes a caption from the tile's own crop. `vlm_method` picks which ones fill each tile's conditioning.
-
-#### Vision tokens
-
-Each tile is assigned vision tokens from two encodes of the image. The tokens are loosely aware of their position and carry their area's tone, palette, and objects.
-
-- **Crop tokens** come from an encode of the tile's own crop, sampled small. They hold the tile to what it contains, so an empty tile does not grow a copy of an object from elsewhere in the image.
-- **Canvas tokens** come from one encode of the entire image. The tile is assigned its own slice of that grid, the tile plus its context rings. Those tokens carry the tile's place in the image and keep a person or a building at the right scale.
-
-No global text prompt is used, so nothing phantom is introduced. The slicing selects tokens by region of interest, the analogue of RoIAlign (He et al., *Mask R-CNN*, ICCV 2017) in conditioning space. This is the fastest method, since one small encode per tile costs far less than one caption.
-
-#### Captions
-
-Each tile's text is used alone as that tile's prompt. The default preset writes the text as [tile tags](#tile-tags). A caption preset has the same VL model write a short description of each tile from that tile's crop alone (see [Presets](#presets)). Naming content removes ambiguity, so artifacts and mushy areas in the source are repaired toward the named thing. The cost scales with tile count and no vision encode is built. Tile texts are stored for the session, keyed by the crop and the preset, so a run at a new seed skips the text pass while the same CLIP stays loaded.
-
-#### Vision tokens and captions
-
-The default method combines the tile's vision tokens and its own text in a single conditioning. The vision tokens keep the tile faithful to the picture and at the right scale. The text names what is there and adds detail. The cost is one small encode plus one text pass per tile.
-
-#### Tile tags
-
-The default preset writes each tile's text as tags with their positions, such as `red car bottom-left`.
-
-1. **List.** The VL model lists the things it sees in the tile. When `prompt` is connected, the VL model also lists the physical things the prompt names, once per image, and every tile checks them. A prompt in another language is translated to English first.
-2. **Verify.** Each candidate is scored with a true or false statement on the tile, and only the tags with a near certain score are kept.
-3. **Locate.** Six strips of the tile, three rows and three columns, give each tag its position, and a tag that no strip holds is dropped.
-
-The scoring reads the VL model's answer probabilities through [logit-classifier](https://pypi.org/project/logit-classifier/). A long prompt adds one pass per image and never lengthens a tile's own listing.
-
-### Regions, batches, and control
-
-#### Masked refine
-
-With a `mask`, the node crops to the masked region plus a `context_anchor` border, refines only that region against the frozen surrounding pixels, and composites it back with a 1px anti-aliased edge. The rest of the image is untouched. On the VL node the canvas tokens come from the full image, so the region is refined aware of its surroundings.
-
-#### Batches
-
-Each picture in a batch is refined on its own, so peak VRAM does not scale with batch size. Every picture gets its own conditioning, its own seam placement and color match on the base node, and its own synchronized run on the VL nodes.
-
-#### Guider and ControlNet
-
-The `guider` input takes any guider, including NAG for models without negative prompt support. ControlNet works on the base node. The control hint is cropped to each tile, so depth, canny, or pose guidance lands on the right pixels. The hint must be the same size as the input image. The VL nodes ignore ControlNet and log a warning, since every tile's positive is replaced by its own conditioning and there is nothing for a hint to attach to. GLIGEN, area masks, and reference latents pass through unchanged.
-
-## Settings file
-
-The VL nodes read their settings from `settings.toml` in the node's folder. Copy it to `settings.user.toml` and edit the copy. The nodes read `settings.user.toml` whenever it exists, and a node update never replaces it. The header of each settings file documents every key. The [Tile Test: Settings](#tile-test-settings) node shows the keys as its outputs.
-
-- An edit applies on the next run, and the VL nodes re-run when the file changes even when no widget changed.
-- The `vlm_method` options are built when ComfyUI starts, so adding, removing, renaming or moving a preset needs a restart.
-- A mistake in the file stops the run with an error that names the file. If ComfyUI starts with the mistake, the nodes that read the file are missing from the menu and the console prints the reason.
-
-### Vision table
-
-The `[vision]` table sets how much of the image each tile's conditioning reads, for every `vlm_method` option.
-
-- `canvas_tokens` is the number of [canvas tokens](#vision-tokens) each tile takes from the encode of the entire image.
-- `crop_tokens` is the number of crop tokens from the encode of the tile's own crop.
-- `caption_megapixels` is the size of the picture the VL model reads when it writes a tile caption or the style caption. A tags preset reads it for the style caption only.
-
-Set one token count to 0 to turn that encode off.
-
-### Presets
-
-Each `[presets.<label>]` block adds one option per text method to `vlm_method`. The first block is the default, and its options carry no label. Every other block's options carry its label in parentheses. `settings.toml` ships one preset, `tags`. `settings.user.example.toml` carries presets that write captions instead, such as `prompted`, `standard` and `artwork`. Copy a block from it into your own `settings.user.toml` to use one.
-
-- `tile_text` picks whether each tile's text is written as `tags` or as a `caption`.
-- `tile_tags_instruction` and `prompt_tags_instruction` ask the VL model to list the things in the tile and the things the prompt names.
-- The three threshold keys set the score a tag needs to be kept and to name its position.
-- `tile_caption_instruction` is what the VL model is asked about each tile in a caption preset.
-- `global_style_instruction` is asked about the entire image once per picture. The answer is placed on top of every tile's text so that all tiles follow one style description. Set it to `""` to skip the style caption.
-
-An instruction may hold `{PROMPT}`. The VL nodes and the Tile Test: Captions node write their `prompt` input in its place before the VL model reads the instruction. A preset without `{PROMPT}` ignores the `prompt` input. The `tags` preset skips its prompt question when `prompt` is empty. Any other instruction with `{PROMPT}` stops the run with an error when `prompt` is not connected or is empty.
-
-## Test nodes
-
-Five test nodes ship for tuning tiles and presets. They are not production nodes. Tile Test: Layout, Upscale, Captions and Render chain in that order and run the engine the VL nodes run. Tile Test: Settings feeds one preset's values into the Captions node and the token counts into the Render node.
-
-Example workflow: [Tile test chain](workflows/VL%208k%20upscale%20-%20Test.json)
-
-### Tile Test: Layout
-
-![Tile Test: Layout](test-layout-node.png)
-
-The Layout node solves the tile grid for the size the image has after `upscale_by`. Its overlay draws every tile's crop, overlap and core, labeled with the tile's number. The Captions and Render nodes take tiles by that number.
-
-### Tile Test: Upscale
-
-![Tile Test: Upscale](test-upscale-node.png)
-
-The Upscale node runs the upscale stage of Tile Upscale (VL) as a node of its own, so ComfyUI keeps the upscaled image cached. An image that is already upscaled skips it, with `upscale_by` at 1.0 on the Layout node.
-
-### Tile Test: Settings
-
-![Tile Test: Settings](test-settings-node.png)
-
-The Settings node outputs the values of one preset and the `[vision]` table, one output per key.
-
-### Tile Test: Captions
-
-![Tile Test: Captions](test-captions-node.png)
-
-The Captions node runs the caption or tags pass of the VL nodes on every tile, or only on the tiles you name, with or without their neighbors. Each instruction is a text input, so a trial wording wired from a text node needs no file edit. The text outputs show every stage of the tags pass for each tile. They are Markdown for the Markdown mode of Preview as Text, which needs Nodes 2.0 turned on.
-
-### Tile Test: Render
-
-![Tile Test: Render](test-render-node.png)
-
-The Render node refines the entire canvas, or only the tiles you name, with or without their neighbors. It holds the seed, so a new seed never upscales or captions the image again.
+| Latent scale (pixels per latent cell) | read from the VAE (`vae.spacial_compression_encode()`): 8 for SD/SDXL/Flux.1/Z-Image, 16 for FLUX.2/MOSS-Image | `latent_scale` |
+| Pixel grid for canvas, tiles and rings | the latent scale | `pixel_multiple`, e.g. 32 for a 16x VAE with a DiT patch size of 2 (MiniMax H3), or 16 for Flux.1 if you want patch-exact tiles |
+| Tile cap | 1024, or 768 for SD1.x/2.x | `max_tile_width` / `max_tile_height` |
+| Ring widths | your minimums, rounded up to whole latent cells and the grid | `context_anchor` / `context_overlap` |
+
+## What the fork changes
+
+- **Any latent scale.** Upstream assumed 8x in about 30 places (`// 8`, `scale=8`, padding to /8, the grid's `multiple=8`, the mask snap). A `LatentGeometry` (latent cell size + pixel grid, `geometry.py`) is now read from the VAE and threaded through the base node's whole raster path: canvas padding, grid solve, the noise canvas and its per-tile slices, denoise masks, region gates and the mask bounding box. Rings are snapped onto whole latent cells. With an 8x VAE the code path is unchanged, and upstream's test suite passes untouched.
+- **Stepwise Tile Upscale**, a new multi-step node with its own planner (`stepwise_plan.py`, pure Python).
+- **Tile Refine (Any VAE)**, the base node with `latent_scale` / `pixel_multiple` overrides.
+- Only these two nodes are registered, under their own class names. Upstream's VL nodes and tile test nodes stay in the code (they were built for Krea 2's Qwen3-VL encoder and are not adapted to non-8x VAEs) but are not registered.
+- No runtime dependency: `logit-classifier` was only needed by the VL nodes and is now a test extra.
+
+## Known limitations
+
+- The VL nodes from upstream are not registered and still assume an 8x VAE.
+- Tiles are refined one after another in raster order (upstream's base engine). A seam is hidden by context rings, a thin directional feather, a minimum-error cut and a DC match, not prevented. Very smooth gradients may need a wider `context_overlap`.
+- On the final step, and on intermediate steps the planner could not snap within `aspect_tolerance`, the last tile of an axis can be narrower than the others.
+- `plan_only` still runs the nodes upstream of it (model and text encoder loading), since ComfyUI executes the inputs first.
+- An upscale model runs only on step 1. A fixed 4x model on a large source can still produce a big image there; the plan warns above 40 MP.
+- Randomly shifted tile grids per step (TiledKSampler-style) are not implemented yet. The grid code is kept separate from the planner so that such a tile mode can be added later.
+
+## Tests
+
+```
+pip install pytest logit-classifier
+COMFYUI_ROOT=/path/to/ComfyUI python -m pytest tests -m "not gpu"
+```
+
+`tests/test_stepwise.py` covers the fork: the geometry, the planner's invariants (exact final size, no remainder tiles, every size on the grid and under the cap, no resampling), and both nodes end to end with fake VAEs at 8x (bit-identical to upstream), 16x with 128 channels (FLUX.2 / MOSS-Image) and a 32 px grid (MiniMax H3). The rest is upstream's suite.
 
 ## License
 
-[GPLv3](LICENSE)
+[GPLv3](LICENSE). Original work © Blakeem, [ComfyUI-ContextAnchoredTileRefine](https://github.com/Blakeem/ComfyUI-ContextAnchoredTileRefine). Changes in this fork are released under the same license.

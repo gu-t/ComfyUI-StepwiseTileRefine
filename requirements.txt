@@ -1,1 +1,1 @@
-logit-classifier>=0.5.0
+# No runtime dependencies beyond ComfyUI. See pyproject.toml [project.optional-dependencies] test.

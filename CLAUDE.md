@@ -1,3 +1,26 @@
+# ComfyUI-StepwiseTileRefine (fork), read this first
+
+This repository is a fork of Blakeem/ComfyUI-ContextAnchoredTileRefine. Everything below the
+fork section is upstream's guide and still describes the shared engine; its machine paths are
+upstream's own.
+
+- Registered nodes: ONLY `StepwiseTileUpscale` ("Stepwise Tile Upscale") and
+  `StepwiseTileRefineAnyVAE` ("Tile Refine (Any VAE)"), category `image/upscaling/stepwise`,
+  in `context_anchored_tile_refine/stepwise_nodes.py`. Upstream's VL and test nodes stay in the
+  code but are not registered, so the package installs beside the original.
+- `geometry.py` (stdlib only): `LatentGeometry(scale, multiple)` = pixels per latent cell (read
+  from `vae.spacial_compression_encode()`) and the pixel grid every canvas, tile base and ring
+  lands on. `EIGHT` is upstream's hard-coded /8 and the default of every function that takes a
+  geometry, so an 8x VAE runs the exact upstream path. `refine_image(geometry=None)` resolves it
+  from the VAE on the raster path only (the VL sync path still assumes 8). `snap_rings` rounds
+  overlap up to whole cells and anchor + overlap up to the grid (identity for /8 values at 8x).
+- `stepwise_plan.py` (stdlib only): the multi-step planner and its Markdown plan. The final size
+  is always exact; intermediates prefer sizes that split into equal tiles within
+  `aspect_tolerance`. Keep the tile mode separate from the planner: a randomly offset grid per
+  step (TiledKSampler-style) is planned as a later, alternative tile mode.
+- Gate: `COMFYUI_ROOT=<core> <venv> -m pytest tests -m "not gpu"` plus `ruff check .` (0.16.2).
+  `tests/test_stepwise.py` is the fork's suite (fake VAEs at 8x, 16x/128 ch and a 32 px grid).
+
 # Context-Anchored Tile Refine, project guide
 
 ComfyUI custom node package, three production nodes plus a five node testing chain
