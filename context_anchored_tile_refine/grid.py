@@ -247,11 +247,12 @@ def build_layout(W, H, sx, sy, ctx, overlap=0):
     )
 
 
-def solve_layout(W, H, cap_w, cap_h, ctx, overlap=0):
+def solve_layout(W, H, cap_w, cap_h, ctx, overlap=0, multiple=8):
     # The production solve, in one place, so both engines and the Layout test node cannot
-    # drift apart on the grid a canvas gets.
-    sx = solve_axis(W, cap_w, ctx, overlap, axis="width")
-    sy = solve_axis(H, cap_h, ctx, overlap, axis="height")
+    # drift apart on the grid a canvas gets. `multiple` is the run's pixel granularity
+    # (geometry.LatentGeometry.multiple), 8 for every 8x VAE.
+    sx = solve_axis(W, cap_w, ctx, overlap, multiple=multiple, axis="width")
+    sy = solve_axis(H, cap_h, ctx, overlap, multiple=multiple, axis="height")
     return build_layout(W, H, sx, sy, ctx, overlap)
 
 

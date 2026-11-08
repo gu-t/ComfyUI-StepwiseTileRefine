@@ -7,6 +7,7 @@ import struct
 import torch
 
 from . import captions, conds, grid
+from .geometry import EIGHT, resolve_geometry, snap_rings
 
 # How a seam is hidden is not configurable, by design: the node exposes only the geometry
 # that genuinely depends on the image (the tile caps, context_anchor, context_overlap) and
@@ -441,7 +442,7 @@ def _mask_bbox(mask_bin):
     return (y0, y1, x0, x1)
 
 
-def _expand_snap_clamp(bbox, anchor, H, W):
+def _expand_snap_clamp(bbox, anchor, H, W, multiple=8):
     # Expand the bbox by `anchor` (the frozen-background halo the subject conditions
     # against), snap x0/y0 DOWN and x1/y1 UP to /8, then clamp to [0,H]/[0,W] and floor the
     # result at 8px. Snapping before clamping keeps interior edges on the /8 grid; a mask
@@ -449,21 +450,23 @@ def _expand_snap_clamp(bbox, anchor, H, W):
     # internal pad then handles. That pad is reflect-mode, so it needs pad < dim: with
     # anchor=0 the clamp can leave fewer than 8px against a non-/8 border, hence the floor
     # (node.py guarantees H,W >= 8, so widening back always fits).
+    # `multiple` is the run's pixel granularity (8 for every 8x VAE, see geometry.py).
+    m = multiple
     y0, y1, x0, x1 = bbox
-    y0 = ((y0 - anchor) // 8) * 8
-    x0 = ((x0 - anchor) // 8) * 8
-    y1 = ((y1 + anchor + 7) // 8) * 8
-    x1 = ((x1 + anchor + 7) // 8) * 8
+    y0 = ((y0 - anchor) // m) * m
+    x0 = ((x0 - anchor) // m) * m
+    y1 = ((y1 + anchor + m - 1) // m) * m
+    x1 = ((x1 + anchor + m - 1) // m) * m
     y0 = max(0, y0)
     x0 = max(0, x0)
     y1 = min(H, y1)
     x1 = min(W, x1)
-    if y1 - y0 < 8:
-        y0 = max(0, y1 - 8)
-        y1 = min(H, y0 + 8)
-    if x1 - x0 < 8:
-        x0 = max(0, x1 - 8)
-        x1 = min(W, x0 + 8)
+    if y1 - y0 < m:
+        y0 = max(0, y1 - m)
+        y1 = min(H, y0 + m)
+    if x1 - x0 < m:
+        x0 = max(0, x1 - m)
+        x1 = min(W, x0 + m)
     return y0, y1, x0, x1
 
 
@@ -481,7 +484,7 @@ def _aa_alpha(sub_mask):
     return x[:, 0]
 
 
-def refine_masked_region(image, mask, context_anchor, refine_crop):
+def refine_masked_region(image, mask, context_anchor, refine_crop, multiple=8):
     # The mask wrapper both engines share: harden (>=0.5) → bbox of THIS picture's mask row →
     # crop to bbox + context_anchor (frozen-background halo) → refine_crop(sub_image, sub_mask,
     # (y0, y1, x0, x1)) → composite the refined crop back through a 1px anti-aliased edge. The
@@ -497,7 +500,7 @@ def refine_masked_region(image, mask, context_anchor, refine_crop):
         # the mask's content.
         return image[..., :3].clone()
     height, width = int(image.shape[1]), int(image.shape[2])
-    y0, y1, x0, x1 = _expand_snap_clamp(bbox, context_anchor, height, width)
+    y0, y1, x0, x1 = _expand_snap_clamp(bbox, context_anchor, height, width, multiple)
     sub_image = image[:, y0:y1, x0:x1, :]
     sub_mask = mask_bin[:, y0:y1, x0:x1].to(image.dtype)
     refined_sub = refine_crop(sub_image, sub_mask, (y0, y1, x0, x1))
@@ -650,7 +653,7 @@ def encode_pixels(vae, pixels):
     return vae.encode(pixels)
 
 
-def build_canvas_noise(vae, noise, canvas_h, canvas_w, batch=1, batch_size=1, batch_index=0):
+def build_canvas_noise(vae, noise, canvas_h, canvas_w, batch=1, batch_size=1, batch_index=0, latent_scale=8):
     # ONE canvas-wide draw, sliced per tile by both engines: per-tile draws would give every
     # same-shaped tile identical noise, and slices are spatially anchored so overlapping crops
     # agree. prepare_noise reads only size/dtype/layout, so the zeros dummy (encode outputs
@@ -665,7 +668,7 @@ def build_canvas_noise(vae, noise, canvas_h, canvas_w, batch=1, batch_size=1, ba
     # `batch` and takes no slice.
     latent_time = (1,) if getattr(vae, "latent_dim", 2) == 3 else ()
     draw_batch = batch_size if batch_size > 1 else batch
-    dummy = torch.zeros((draw_batch, vae.latent_channels, *latent_time, canvas_h // 8, canvas_w // 8), dtype=torch.float32)
+    dummy = torch.zeros((draw_batch, vae.latent_channels, *latent_time, canvas_h // latent_scale, canvas_w // latent_scale), dtype=torch.float32)
     canvas_noise = noise.generate_noise({"samples": dummy})
     if batch_size > 1:
         canvas_noise = canvas_noise[batch_index:batch_index + 1]
@@ -751,7 +754,7 @@ def build_step_noise(sampler, canvas_shape, seed, batch_index=0):
     return StepNoiseField(canvas_shape, seed, batch_index)
 
 
-def region_gates(region_pixel, canvas_h, canvas_w):
+def region_gates(region_pixel, canvas_h, canvas_w, latent_scale=8):
     # The region gate at pixel and at latent resolution, as (region_padded, region_latent).
     # The pixel mask is padded onto the /8 canvas with constant 0 (the padded strip is always
     # cropped away), then cover-downsampled by 8 with max_pool2d, NOT avg+threshold, so every
@@ -760,7 +763,7 @@ def region_gates(region_pixel, canvas_h, canvas_w):
     # the mask and the anti-aliased composite discards them.
     height, width = region_pixel.shape[-2], region_pixel.shape[-1]
     region_padded = torch.nn.functional.pad(region_pixel, (0, canvas_w - width, 0, canvas_h - height))
-    region_latent = (torch.nn.functional.max_pool2d(region_padded[:, None].float(), 8) > 0).float()[:, 0]
+    region_latent = (torch.nn.functional.max_pool2d(region_padded[:, None].float(), latent_scale) > 0).float()[:, 0]
     return region_padded, region_latent
 
 
@@ -773,7 +776,7 @@ def fold_decoded_frames(decoded):
     return decoded
 
 
-def _refine_tiles(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor, context_overlap, region_pixel=None, *, hint_canvas=None, batch_size=1, batch_index=0):
+def _refine_tiles(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor, context_overlap, region_pixel=None, *, hint_canvas=None, batch_size=1, batch_index=0, geometry=EIGHT):
     # Tiled img2img: pad to /8 → solve the grid → encode/sample/decode each tile in
     # raster order from a live canvas → DC-match onto the already-placed neighbors →
     # composite by a directional feather → crop back.
@@ -790,11 +793,14 @@ def _refine_tiles(image, guider, sampler, sigmas, vae, noise, max_tile_width, ma
     # batch_size/batch_index name this call's picture inside refine_image's picture loop
     # (batch == 1 there). They reach the noise draw and the progress bar only; 1/0 — a
     # direct call, or a single-picture IMAGE — changes nothing.
+    # geometry (geometry.LatentGeometry) is the VAE's latent cell size and the pixel grid every
+    # canvas, tile and ring lands on. EIGHT, the default, is upstream's hard-coded /8 grid.
     import comfy.model_management
     import comfy.samplers
 
     pixels = image[..., :3]
-    padded, (height, width) = pad_image_to_multiple(pixels)
+    scale = geometry.scale
+    padded, (height, width) = pad_image_to_multiple(pixels, geometry.multiple)
     batch, canvas_h, canvas_w = padded.shape[0], padded.shape[1], padded.shape[2]
 
     # Ride the hints onto the same padded canvas as the pixels — same reflect pad, same
@@ -808,10 +814,10 @@ def _refine_tiles(image, guider, sampler, sigmas, vae, noise, max_tile_width, ma
     region_padded = None
     region_latent = None
     if region_pixel is not None:
-        region_padded, region_latent = region_gates(region_pixel, canvas_h, canvas_w)
+        region_padded, region_latent = region_gates(region_pixel, canvas_h, canvas_w, scale)
 
-    layout = grid.solve_layout(canvas_w, canvas_h, max_tile_width, max_tile_height, context_anchor, context_overlap)
-    canvas_noise = build_canvas_noise(vae, noise, canvas_h, canvas_w, batch, batch_size, batch_index)
+    layout = grid.solve_layout(canvas_w, canvas_h, max_tile_width, max_tile_height, context_anchor, context_overlap, multiple=geometry.multiple)
+    canvas_noise = build_canvas_noise(vae, noise, canvas_h, canvas_w, batch, batch_size, batch_index, latent_scale=scale)
     # Per-tile per-step draws refine every overlap band with two unrelated textures, which the
     # feather then smudges together (tests-AB/probe_raster_noise_band.py).
     step_noise = build_step_noise(sampler, canvas_noise.shape, noise.seed, batch_index)
@@ -864,7 +870,7 @@ def _refine_tiles(image, guider, sampler, sigmas, vae, noise, max_tile_width, ma
         # .contiguous() because downstream sampler code may .view() the slice; a 1x1
         # grid slices the full tensor, so it returns self unchanged. The ellipsis
         # slices the trailing spatial dims of both the 4-D and the 5-D noise layout.
-        ly0, ly1, lx0, lx1 = crop.y0 // 8, crop.y1 // 8, crop.x0 // 8, crop.x1 // 8
+        ly0, ly1, lx0, lx1 = crop.y0 // scale, crop.y1 // scale, crop.x0 // scale, crop.x1 // scale
         tile_noise = canvas_noise[..., ly0:ly1, lx0:lx1].contiguous()
         tile_sampler = sampler
         if step_noise is not None:
@@ -880,7 +886,7 @@ def _refine_tiles(image, guider, sampler, sigmas, vae, noise, max_tile_width, ma
             raise RuntimeError(
                 f"VAE encoded a {crop.x1 - crop.x0}x{crop.y1 - crop.y0} px tile to latent shape {tuple(tile_latent.shape)}, but the tile's noise slice is {tuple(tile_noise.shape)}. "
                 "This VAE's latent layout is not supported (e.g. a video VAE folding an image batch "
-                "into frames, or a non-8x spatial compression).")
+                f"into frames, or a VAE whose spatial compression is not the {scale}x this run assumed; set latent_scale to override).")
         # Binary latent denoise_mask: full-strength denoise over core+overlap
         # (== tile.overlap_inner_rect), frozen only through the context_anchor ring.
         # Binary because the static inpaint blend re-applies this mask every step, so a
@@ -890,14 +896,14 @@ def _refine_tiles(image, guider, sampler, sigmas, vae, noise, max_tile_width, ma
         # surrounding background stays frozen context; the n=1 (unexpanded) masked case
         # yields denoise_mask = region_latent (NOT None), anchoring the in-crop background.
         if region_pixel is None:
-            denoise_mask = denoise_indicator(crop, tile.overlap_inner_rect, scale=8) if expanded else None
+            denoise_mask = denoise_indicator(crop, tile.overlap_inner_rect, scale=scale) if expanded else None
         else:
-            reg = region_latent[:, crop.y0 // 8:crop.y1 // 8, crop.x0 // 8:crop.x1 // 8]
+            reg = region_latent[:, ly0:ly1, lx0:lx1]
             # .to(reg.device): denoise_indicator builds its mask from torch.arange, so it is
             # always CPU, while region_latent follows the MASK/IMAGE device (CUDA under
             # --gpu-only). The multiply below is elementwise, so it would raise across devices
             # on every multi-tile masked refine. A no-op when both are already CPU.
-            inner_mask = denoise_indicator(crop, tile.overlap_inner_rect, scale=8).to(reg.device) if expanded else 1.0
+            inner_mask = denoise_indicator(crop, tile.overlap_inner_rect, scale=scale).to(reg.device) if expanded else 1.0
             denoise_mask = inner_mask * reg
         # Per-tile ControlNet swap: the swapped map's control chains are fresh copies whose
         # hints are this tile's crop_rect slice, so core's rescale is an identity and the hint
@@ -982,7 +988,7 @@ def _mask_row(mask, batch_index):
     return mask[row:row + 1]
 
 
-def refine_image(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor, context_overlap, mask=None, vl_clip=None, vlm_method=captions.VLM_METHOD_VISION, anchor_source=None, sampler_name=None, batch_size=1, batch_index=0, progress=None, preset=None, tile_captions=None, layout=None, noise_fields=None):
+def refine_image(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor, context_overlap, mask=None, vl_clip=None, vlm_method=captions.VLM_METHOD_VISION, anchor_source=None, sampler_name=None, batch_size=1, batch_index=0, progress=None, preset=None, tile_captions=None, layout=None, noise_fields=None, geometry=None):
     # Entry point, and the ONE place all three nodes meet. With a vl_clip the whole refine is
     # handed to the sync engine (sync.py) — mask or no mask — and everything below it is the
     # BASE node's raster path.
@@ -1010,6 +1016,9 @@ def refine_image(image, guider, sampler, sigmas, vae, noise, max_tile_width, max
     # captions, the tile rects and the SDE field that grid's own run would have used. They are
     # rejected here rather than ignored, because a dropped override samples the wrong thing
     # silently.
+    # geometry (geometry.LatentGeometry) is the raster path's latent cell size and pixel grid.
+    # None reads the scale off the VAE (8 for every 8x VAE, which keeps that path bit-identical),
+    # and the two rings are snapped onto it (geometry.snap_rings, a no-op for any /8 value at 8x).
     overrides = {"preset": preset, "tile_captions": tile_captions, "layout": layout,
                  "noise_fields": noise_fields}
     given = sorted(name for name, value in overrides.items() if value is not None)
@@ -1032,6 +1041,21 @@ def refine_image(image, guider, sampler, sigmas, vae, noise, max_tile_width, max
         # already, so it sits ABOVE the picture loop and stays one pure clone.
         return image[..., :3].clone()
 
+    if vl_clip is None:
+        if geometry is None:
+            geometry = resolve_geometry(vae)
+        snapped = snap_rings(context_anchor, context_overlap, geometry)
+        if snapped != (context_anchor, context_overlap):
+            logging.info(
+                "Tile Refine: context_anchor %d / context_overlap %d rounded up to %d / %d to sit on whole %d px "
+                "latent cells and the %d px tile grid.", context_anchor, context_overlap, snapped[0], snapped[1],
+                geometry.scale, geometry.multiple)
+            context_anchor, context_overlap = snapped
+        if image.shape[1] < geometry.multiple or image.shape[2] < geometry.multiple:
+            raise ValueError(
+                f"Tile Refine: the image is {image.shape[2]}x{image.shape[1]} px, smaller than the "
+                f"{geometry.multiple} px grid this VAE needs.")
+
     # PICTURE loop: a batched IMAGE is refined ONE PICTURE AT A TIME, then concatenated back.
     # Everything below is a per-picture quantity that a shared call silently pools across
     # unrelated pictures: seam_dc_offset's median over [B,h,w,C] band pixels yields one offset
@@ -1042,7 +1066,7 @@ def refine_image(image, guider, sampler, sigmas, vae, noise, max_tile_width, max
     # single-picture IMAGE never enters the loop, so its path is untouched.
     if image.shape[0] > 1:
         pictures = [
-            refine_image(image[b:b + 1], guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor, context_overlap, mask=_mask_row(mask, b), vl_clip=vl_clip, vlm_method=vlm_method, anchor_source=anchor_source, sampler_name=sampler_name, batch_size=image.shape[0], batch_index=b, progress=progress, preset=preset)
+            refine_image(image[b:b + 1], guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor, context_overlap, mask=_mask_row(mask, b), vl_clip=vl_clip, vlm_method=vlm_method, anchor_source=anchor_source, sampler_name=sampler_name, batch_size=image.shape[0], batch_index=b, progress=progress, preset=preset, geometry=geometry)
             for b in range(image.shape[0])
         ]
         return torch.cat(pictures, dim=0)
@@ -1090,13 +1114,13 @@ def refine_image(image, guider, sampler, sigmas, vae, noise, max_tile_width, max
         # entirely for a single-picture run, which keeps the caller's own hint tensors.
         if batch_size > 1 and hint_canvas is not None:
             hint_canvas = conds.slice_hint_row(hint_canvas, batch_index)
-        return _refine_tiles(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor, context_overlap, region_pixel=None, hint_canvas=hint_canvas, batch_size=batch_size, batch_index=batch_index)
+        return _refine_tiles(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor, context_overlap, region_pixel=None, hint_canvas=hint_canvas, batch_size=batch_size, batch_index=batch_index, geometry=geometry)
 
     def refine_crop(sub_image, sub_mask, crop_box):
         # The hints take the same bbox slice the image does.
         hint_canvas = conds.prepare_hint_canvas(original_conds, (image.shape[1], image.shape[2]), crop_box) if control_active else None
         if batch_size > 1 and hint_canvas is not None:
             hint_canvas = conds.slice_hint_row(hint_canvas, batch_index)
-        return _refine_tiles(sub_image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor, context_overlap, region_pixel=sub_mask, hint_canvas=hint_canvas, batch_size=batch_size, batch_index=batch_index)
+        return _refine_tiles(sub_image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor, context_overlap, region_pixel=sub_mask, hint_canvas=hint_canvas, batch_size=batch_size, batch_index=batch_index, geometry=geometry)
 
-    return refine_masked_region(image, mask, context_anchor, refine_crop)
+    return refine_masked_region(image, mask, context_anchor, refine_crop, geometry.multiple)

@@ -14,7 +14,7 @@ def loaded_package():
     # Replicates the 0.3.45 loader (nodes.py:2119-2124): spec from the package's
     # __init__.py, registered in sys.modules BEFORE exec_module so relative imports
     # resolve via the spec's submodule_search_locations.
-    module_name = "ComfyUI-ContextAnchoredTileUpscale_x_test"
+    module_name = "ComfyUI-StepwiseTileRefine_x_test"
     spec = importlib.util.spec_from_file_location(module_name, REPO_ROOT / "__init__.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
@@ -26,65 +26,22 @@ def loaded_package():
 
 
 def test_loads_via_comfyui_directory_mechanism(loaded_package):
-    node_class = loaded_package.NODE_CLASS_MAPPINGS["ContextAnchoredTileRefine"]
-    vl_class = loaded_package.NODE_CLASS_MAPPINGS["ContextAnchoredTileRefineVL"]
-    upscale_class = loaded_package.NODE_CLASS_MAPPINGS["ContextAnchoredTileUpscaleVL"]
-    test_settings_class = loaded_package.NODE_CLASS_MAPPINGS["ContextAnchoredTileTestSettings"]
-    test_layout_class = loaded_package.NODE_CLASS_MAPPINGS["ContextAnchoredTileTestLayout"]
-    test_upscale_class = loaded_package.NODE_CLASS_MAPPINGS["ContextAnchoredTileTestUpscale"]
-    test_captions_class = loaded_package.NODE_CLASS_MAPPINGS["ContextAnchoredTileTestCaptions"]
-    test_render_class = loaded_package.NODE_CLASS_MAPPINGS["ContextAnchoredTileTestRender"]
-    assert isinstance(node_class, type)
-    assert isinstance(vl_class, type)
+    # The fork registers only its own two nodes, under its own class names, so it installs
+    # beside the original Context-Anchored Tile Refine without a name clash.
+    upscale_class = loaded_package.NODE_CLASS_MAPPINGS["StepwiseTileUpscale"]
+    refine_class = loaded_package.NODE_CLASS_MAPPINGS["StepwiseTileRefineAnyVAE"]
     assert isinstance(upscale_class, type)
-    assert isinstance(test_settings_class, type)
-    assert isinstance(test_layout_class, type)
-    assert isinstance(test_upscale_class, type)
-    assert isinstance(test_captions_class, type)
-    assert isinstance(test_render_class, type)
+    assert isinstance(refine_class, type)
     assert {
-        "ContextAnchoredTileRefine": node_class,
-        "ContextAnchoredTileRefineVL": vl_class,
-        "ContextAnchoredTileUpscaleVL": upscale_class,
-        "ContextAnchoredTileTestSettings": test_settings_class,
-        "ContextAnchoredTileTestLayout": test_layout_class,
-        "ContextAnchoredTileTestUpscale": test_upscale_class,
-        "ContextAnchoredTileTestCaptions": test_captions_class,
-        "ContextAnchoredTileTestRender": test_render_class,
+        "StepwiseTileUpscale": upscale_class,
+        "StepwiseTileRefineAnyVAE": refine_class,
     } == loaded_package.NODE_CLASS_MAPPINGS
-    assert loaded_package.NODE_DISPLAY_NAME_MAPPINGS.keys() == loaded_package.NODE_CLASS_MAPPINGS.keys()
-    assert (
-        loaded_package.NODE_DISPLAY_NAME_MAPPINGS["ContextAnchoredTileRefine"]
-        == "Context-Anchored Tile Refine"
-    )
-    assert (
-        loaded_package.NODE_DISPLAY_NAME_MAPPINGS["ContextAnchoredTileRefineVL"]
-        == "Context-Anchored Tile Refine (VL)"
-    )
-    assert (
-        loaded_package.NODE_DISPLAY_NAME_MAPPINGS["ContextAnchoredTileUpscaleVL"]
-        == "Context-Anchored Tile Upscale (VL)"
-    )
-    assert (
-        loaded_package.NODE_DISPLAY_NAME_MAPPINGS["ContextAnchoredTileTestSettings"]
-        == "Tile Test: Settings"
-    )
-    assert (
-        loaded_package.NODE_DISPLAY_NAME_MAPPINGS["ContextAnchoredTileTestLayout"]
-        == "Tile Test: Layout"
-    )
-    assert (
-        loaded_package.NODE_DISPLAY_NAME_MAPPINGS["ContextAnchoredTileTestUpscale"]
-        == "Tile Test: Upscale"
-    )
-    assert (
-        loaded_package.NODE_DISPLAY_NAME_MAPPINGS["ContextAnchoredTileTestCaptions"]
-        == "Tile Test: Captions"
-    )
-    assert (
-        loaded_package.NODE_DISPLAY_NAME_MAPPINGS["ContextAnchoredTileTestRender"]
-        == "Tile Test: Render"
-    )
+    assert loaded_package.NODE_DISPLAY_NAME_MAPPINGS == {
+        "StepwiseTileUpscale": "Stepwise Tile Upscale",
+        "StepwiseTileRefineAnyVAE": "Tile Refine (Any VAE)",
+    }
+    for node_class in loaded_package.NODE_CLASS_MAPPINGS.values():
+        assert node_class.CATEGORY == "image/upscaling/stepwise"
     assert "NODE_CLASS_MAPPINGS" in loaded_package.__all__
     assert "NODE_DISPLAY_NAME_MAPPINGS" in loaded_package.__all__
 
@@ -336,3 +293,18 @@ def test_requirements_txt_matches_pyproject_dependencies():
     lines = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
     required = [line.strip() for line in lines if line.strip() and not line.startswith("#")]
     assert required == declared
+
+
+@pytest.mark.parametrize("module, banned", [
+    ("geometry", ("comfy", "torch")),
+    ("stepwise_plan", ("comfy", "torch")),
+    ("stepwise_nodes", ("comfy", "latent_preview")),
+])
+def test_fork_modules_keep_the_import_contract(module, banned):
+    # geometry.py and stepwise_plan.py are pure stdlib like grid.py, and stepwise_nodes.py is
+    # comfy-free at module scope like node.py.
+    lines = ["import sys", f"import context_anchored_tile_refine.{module}"]
+    lines += [f"assert {name!r} not in sys.modules, '{module} imported {name}'" for name in banned]
+    code = "\n".join(lines) + "\n"
+    result = subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr

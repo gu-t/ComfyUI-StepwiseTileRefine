@@ -1,36 +1,17 @@
-from .context_anchored_tile_refine.node import (
-    ContextAnchoredTileRefine,
-    ContextAnchoredTileRefineVL,
-    ContextAnchoredTileUpscaleVL,
-)
-from .context_anchored_tile_refine.testing import (
-    ContextAnchoredTileTestCaptions,
-    ContextAnchoredTileTestLayout,
-    ContextAnchoredTileTestRender,
-    ContextAnchoredTileTestSettings,
-    ContextAnchoredTileTestUpscale,
-)
+# ComfyUI-StepwiseTileRefine, a fork of Blakeem/ComfyUI-ContextAnchoredTileRefine (GPL-3.0).
+# Only the fork's own nodes are registered, under their own class names and category, so this
+# package can be installed beside the original. The upstream nodes' code stays in the package
+# (the fork's nodes build on it) but is not registered here; install the original for those.
+from .context_anchored_tile_refine.stepwise_nodes import StepwiseTileUpscale, TileRefineAnyVAE
 
 NODE_CLASS_MAPPINGS = {
-    "ContextAnchoredTileRefine": ContextAnchoredTileRefine,
-    "ContextAnchoredTileRefineVL": ContextAnchoredTileRefineVL,
-    "ContextAnchoredTileUpscaleVL": ContextAnchoredTileUpscaleVL,
-    "ContextAnchoredTileTestSettings": ContextAnchoredTileTestSettings,
-    "ContextAnchoredTileTestLayout": ContextAnchoredTileTestLayout,
-    "ContextAnchoredTileTestUpscale": ContextAnchoredTileTestUpscale,
-    "ContextAnchoredTileTestCaptions": ContextAnchoredTileTestCaptions,
-    "ContextAnchoredTileTestRender": ContextAnchoredTileTestRender,
+    "StepwiseTileUpscale": StepwiseTileUpscale,
+    "StepwiseTileRefineAnyVAE": TileRefineAnyVAE,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ContextAnchoredTileRefine": "Context-Anchored Tile Refine",
-    "ContextAnchoredTileRefineVL": "Context-Anchored Tile Refine (VL)",
-    "ContextAnchoredTileUpscaleVL": "Context-Anchored Tile Upscale (VL)",
-    "ContextAnchoredTileTestSettings": "Tile Test: Settings",
-    "ContextAnchoredTileTestLayout": "Tile Test: Layout",
-    "ContextAnchoredTileTestUpscale": "Tile Test: Upscale",
-    "ContextAnchoredTileTestCaptions": "Tile Test: Captions",
-    "ContextAnchoredTileTestRender": "Tile Test: Render",
+    "StepwiseTileUpscale": "Stepwise Tile Upscale",
+    "StepwiseTileRefineAnyVAE": "Tile Refine (Any VAE)",
 }
 
 __all__ = [
