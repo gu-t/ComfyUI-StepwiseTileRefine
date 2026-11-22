@@ -233,12 +233,16 @@ class FixedPlanner:
 class TiledModelWrapper:
     """The `model_function_wrapper` that runs one model call as tile windows. `inner` is a wrapper
     already on the model, run per window in place of apply_model. `log`, when a list, records
-    (sigma, dy, dx, windows) per call for tests."""
+    (sigma, dy, dx, windows) per call for tests. `check_interrupt` runs before every window, so a
+    cancel lands within one window rather than one whole step. `calls` counts the model calls it
+    has handled, which is how the run proves the guider actually used it."""
 
-    def __init__(self, planner, inner=None, log=None):
+    def __init__(self, planner, inner=None, log=None, check_interrupt=None):
         self.planner = planner
         self.inner = inner
         self.log = log
+        self.check_interrupt = check_interrupt
+        self.calls = 0
 
     def __call__(self, apply_model, args):
         x, timestep, c = args["input"], args["timestep"], args["c"]
@@ -247,10 +251,13 @@ class TiledModelWrapper:
         height, width = int(x.shape[-2]), int(x.shape[-1])
         sigma = float(timestep.reshape(-1)[0])
         (dy, dx), windows = self.planner(height, width, sigma)
+        self.calls += 1
         if self.log is not None:
             self.log.append((sigma, dy, dx, len(windows)))
         out = wsum = None
         for win in windows:
+            if self.check_interrupt is not None:
+                self.check_interrupt()
             ys, xs = slice(win.y0, win.y1), slice(win.x0, win.x1)
             tile_c = {key: _slice_spatial(value, height, width, ys, xs) for key, value in c.items()}
             tile_x = x[..., ys, xs]
@@ -383,12 +390,41 @@ def refine_all_at_once(image, guider, sampler, sigmas, vae, noise, max_tile_widt
     latent = sampling.encode_pixels(vae, padded)
     canvas_noise = sampling.build_canvas_noise(vae, noise, canvas_h, canvas_w, batch, batch_size, batch_index,
                                                latent_scale=geometry.scale)
-    run_guider = wrapped_guider(guider, TiledModelWrapper(planner, log=log))
+    wrapper = TiledModelWrapper(planner, log=log,
+                                check_interrupt=comfy.model_management.throw_exception_if_processing_interrupted)
+    run_guider = wrapped_guider(guider, wrapper)
     with tile_memory_estimate(guider, cap_h, cap_w):
-        samples = sampling.sample_latent(run_guider, sampler, sigmas, canvas_noise, seed, latent)
+        samples = sampling.sample_latent(run_guider, sampler, sigmas, canvas_noise, seed, latent,
+                                         callback=_guarded_callback(guider, sigmas, wrapper))
+    _require_wrapper_used(wrapper)
     decoded = sampling.fold_decoded_frames(vae.decode(samples))
     decoded = decoded.to(comfy.model_management.intermediate_device())
     return sampling.crop_image_to(decoded, height, width)
+
+
+def _require_wrapper_used(wrapper):
+    # A guider that builds its model options anywhere but its own `model_options` never reaches the
+    # wrapper, and the model would silently run on the whole canvas at once: wrong output, or an
+    # out-of-memory at large sizes. Fail loudly instead.
+    if wrapper.calls == 0:
+        raise RuntimeError(
+            "All at once tile modes: the guider never called the tiling wrapper, so the model ran on the whole "
+            "image untiled. This guider does not use model_options['model_function_wrapper'] (CFGGuider and "
+            "core's guiders do). Use tile by tile with this guider.")
+
+
+def _guarded_callback(guider, sigmas, wrapper):
+    # The sampler's per-step callback (core's latent preview) with the wrapper check after the first
+    # step, so a guider that bypasses the wrapper stops after one step instead of at the end.
+    import latent_preview
+
+    preview = latent_preview.prepare_callback(guider.model_patcher, sigmas.shape[-1] - 1)
+
+    def callback(step, x0, x, total_steps):
+        _require_wrapper_used(wrapper)
+        preview(step, x0, x, total_steps)
+
+    return callback
 
 
 # --- the Stepwise plan --------------------------------------------------------------------------

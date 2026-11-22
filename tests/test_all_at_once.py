@@ -321,10 +321,73 @@ class WrapperGuider:
             return torch.zeros_like(x)
 
         x = latent_image
-        for sigma in sigmas[:-1].tolist():
+        steps = len(sigmas) - 1
+        for i, sigma in enumerate(sigmas[:-1].tolist()):
             for _ in range(2):
                 x = x + wrapper(apply_model, {"input": x, "timestep": torch.tensor([sigma]), "c": {}, "cond_or_uncond": [0]})
+            if callback is not None:
+                callback(i, x, x, steps)
         return x
+
+
+class BypassGuider(WrapperGuider):
+    """A guider that keeps its options somewhere else: it never calls model_options' wrapper and
+    runs the model on the whole canvas, which is what the run must refuse."""
+
+    def sample(self, noise, latent_image, sampler, sigmas, denoise_mask=None, callback=None, disable_pbar=False, seed=None):
+        self.calls.append({"seed": seed, "shape": tuple(latent_image.shape)})
+        self.tile_sizes.append(tuple(latent_image.shape[-2:]))
+        callback(0, latent_image, latent_image, len(sigmas) - 1)
+        self.tile_sizes.append("past the first step")
+        return latent_image
+
+
+@pytest.mark.parametrize("tile_mode", [ALL_AT_ONCE, SHIFTING])
+def test_a_guider_that_skips_the_wrapper_stops_after_the_first_step(comfy_stubs, tile_mode):
+    guider = BypassGuider()
+    with pytest.raises(RuntimeError, match="never called the tiling wrapper"):
+        TileRefineAnyVAE().refine(_smooth_image(600, 744), guider, object(), SIGMAS, ScaleVAE(16, 128), ZeroNoise(),
+                                  256, 256, 16, 32, tile_mode=tile_mode)
+    assert "past the first step" not in guider.tile_sizes
+
+
+def test_the_interrupt_check_runs_before_every_window():
+    checks = []
+    windows = shifting_windows(30, 30, 8, 8, 1, (3, 5), SIZE_FULL)
+    wrapper = TiledModelWrapper(lambda h, w, s: ((3, 5), windows), check_interrupt=lambda: checks.append(1))
+    wrapper(lambda x, t, **c: x, {"input": torch.zeros(1, 1, 30, 30), "timestep": torch.tensor([0.5]), "c": {}})
+    assert len(checks) == len(windows) > 1 and wrapper.calls == 1
+
+
+@pytest.mark.parametrize("tile_mode", [ALL_AT_ONCE, SHIFTING])
+def test_all_at_once_modes_refine_a_batch_one_picture_at_a_time(comfy_stubs, tile_mode):
+    image = torch.cat([_smooth_image(600, 744), 1.0 - _smooth_image(600, 744)], dim=0)
+    vae = ScaleVAE(16, 128)
+    guider = WrapperGuider()
+    (out,) = TileRefineAnyVAE().refine(image, guider, object(), SIGMAS, vae, ZeroNoise(), 256, 256, 16, 32,
+                                       tile_mode=tile_mode)
+    assert out.shape == image.shape
+    assert [c["shape"][0] for c in guider.calls] == [1, 1]
+    for b in range(2):
+        expected = vae.decode(vae.encode(sampling.pad_image_to_multiple(image[b:b + 1], 16)[0]))[:, :600, :744]
+        assert torch.allclose(out[b:b + 1], expected, atol=1e-6)
+
+
+def test_tile_by_tile_always_full_with_a_mask_keeps_the_background(comfy_stubs):
+    from test_stepwise import CheckingGuider
+
+    image = _smooth_image(600, 744)
+    mask = torch.zeros(1, 600, 744)
+    mask[:, 100:500, 150:650] = 1.0
+    vae = ScaleVAE(16, 128)
+    (out,) = TileRefineAnyVAE().refine(image, CheckingGuider(), object(), SIGMAS, vae, ZeroNoise(), 256, 256, 32, 32,
+                                       mask=mask, tile_size=SIZE_FULL)
+    assert out.shape == image.shape
+    outside = mask[0] < 0.5
+    outside[95:505, 145:655] = False  # the 1 px anti-aliased edge and its neighbourhood
+    assert torch.equal(out[0][outside], image[0][outside])
+    assert vae.encode_shapes and all(w <= 256 and h <= 256 and w % 16 == 0 and h % 16 == 0 for w, h in vae.encode_shapes)
+    assert (256, 256) in vae.encode_shapes
 
 
 @pytest.mark.parametrize("tile_mode", [ALL_AT_ONCE, SHIFTING])

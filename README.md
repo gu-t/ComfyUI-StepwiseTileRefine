@@ -12,6 +12,7 @@ ComfyUI nodes for tiled upscaling that work with **any VAE latent scale**, inclu
 - [The nodes](#the-nodes)
   - [Stepwise Tile Upscale](#stepwise-tile-upscale)
   - [Tile Refine (Any VAE)](#tile-refine-any-vae)
+- [Tile modes](#tile-modes)
 - [How the steps are planned](#how-the-steps-are-planned)
 - [MOSS-Image settings](#moss-image-settings)
 - [Other models](#other-models)
@@ -55,6 +56,8 @@ Upscales in several steps. Each step enlarges the whole image in pixel space and
 | `upscale_model` (optional) | Used for the first step only, then `upscale_method` to that step's exact size. Later steps use `upscale_method` only, so a 4x model never runs on a large intermediate. |
 | `aspect_tolerance` (advanced) | How much aspect-ratio deviation (percent) an intermediate step may take to get tiles of equal size. `0` keeps the closest exact enlargement. The final step is always exact. |
 | `auto_step_factor`, `latent_scale`, `pixel_multiple` (advanced) | See [How the steps are planned](#how-the-steps-are-planned) and [Other models](#other-models). |
+| `tile_mode` | How the tiles are run: `tile by tile` (default), `all at once` or `all at once, shifting`. See [Tile modes](#tile-modes). |
+| `tile_size` | `always full` (default): every window the model sees is grown to exactly `max_tile`. `allow smaller`: windows keep their bare size, so edge tiles can be smaller. |
 
 Outputs: the final `image`, `step_images` (the result of every step, as a list since the sizes differ) and `plan`, a Markdown table that is also written to the log. Connect `plan` to *Preview as Text* in Markdown mode.
 
@@ -78,7 +81,21 @@ Example plan, MOSS-Image, 1280x960 x3, auto steps, noise level 0.35 -> 0.25:
 
 ### Tile Refine (Any VAE)
 
-Upstream's base node (*Context-Anchored Tile Refine*) with the latent scale read from the VAE instead of assumed to be 8. Upscale the image first and feed it in; denoise is set through the sigmas (`BasicScheduler`'s `denoise`). An optional `mask` refines only the masked region. On an 8x VAE it gives byte-identical output to the upstream node.
+Upstream's base node (*Context-Anchored Tile Refine*) with the latent scale read from the VAE instead of assumed to be 8. Upscale the image first and feed it in; denoise is set through the sigmas (`BasicScheduler`'s `denoise`). An optional `mask` refines only the masked region (tile by tile only). It has the same `tile_mode` and `tile_size` widgets as the Stepwise node. With `tile by tile` and `tile_size` `allow smaller` on an 8x VAE it gives byte-identical output to the upstream node.
+
+## Tile modes
+
+`tile_mode` picks how a refine pass runs its tiles. Both nodes have it, with the same options.
+
+| Mode | How it runs | The seam |
+|---|---|---|
+| `tile by tile` | The tiles run one after another in raster order. Each tile is denoised to the end with the full schedule before the next starts. Its ring is frozen: finished neighbours show their finished pixels, the rest show the source. The overlap band is cross-faded into the finished neighbour afterwards. | Hidden by the tile continuing its finished neighbours. |
+| `all at once` | The same tiles as tile by tile, but all of them take every sampler step together. In the overlap bands both neighbours' answers are weighted together at every step. The ring sits at the same noise level as the rest of the image and is only context. Nothing is frozen. | The seams stay in place, but both sides share one band at every step. |
+| `all at once, shifting` | All tiles take every step together on a grid that is shifted by a random x/y offset (drawn from the seed) before every step. The core is `max_tile` minus `context_anchor` on both sides, cores meet edge to edge and `context_overlap` is unused. | The seams move every step, so none builds up. |
+
+The two `all at once` modes put the tiling inside the model call: the sampler runs one ordinary pass over the whole image, and every model evaluation is split into tile windows and put back together. So every sampler works, including ones with history and per-step (ancestral / SDE) noise, and that noise is drawn for the whole image. Windows that come out identical run once. Measured on MOSS-Image at 8 MP with a single-subject prompt at noise level 0.95: `tile by tile` showed clear seams, `all at once` at most faint ones, and `all at once, shifting` none, at about 1.8x the time of the other two.
+
+`tile_size` applies to all three modes. `always full` grows every window to exactly `max_tile` (inward at the image edge): in `tile by tile` and `all at once` the ring grows and the core and band stay the same, and in `all at once, shifting` a thin edge tile slides inward. `allow smaller` keeps the bare windows (cheaper).
 
 ## How the steps are planned
 
@@ -170,17 +187,18 @@ Nothing model-specific is hard-coded. Everything that depends on the model or th
 - **Any latent scale.** Upstream assumed 8x in about 30 places (`// 8`, `scale=8`, padding to /8, the grid's `multiple=8`, the mask snap). A `LatentGeometry` (latent cell size + pixel grid, `geometry.py`) is now read from the VAE and threaded through the base node's whole raster path: canvas padding, grid solve, the noise canvas and its per-tile slices, denoise masks, region gates and the mask bounding box. Rings are snapped onto whole latent cells. With an 8x VAE the code path is unchanged, and upstream's test suite passes untouched.
 - **Stepwise Tile Upscale**, a new multi-step node with its own planner (`stepwise_plan.py`, pure Python).
 - **Tile Refine (Any VAE)**, the base node with `latent_scale` / `pixel_multiple` overrides.
+- **Tile modes** (`all_at_once.py`): `all at once` and `all at once, shifting` next to upstream's raster engine, and `tile_size` `always full`. See [Tile modes](#tile-modes).
 - Only these two nodes are registered, under their own class names. Upstream's VL nodes and tile test nodes stay in the code (they were built for Krea 2's Qwen3-VL encoder and are not adapted to non-8x VAEs) but are not registered.
 - No runtime dependency: `logit-classifier` was only needed by the VL nodes and is now a test extra.
 
 ## Known limitations
 
 - The VL nodes from upstream are not registered and still assume an 8x VAE.
-- Tiles are refined one after another in raster order (upstream's base engine). A seam is hidden by context rings, a thin directional feather, a minimum-error cut and a DC match, not prevented. Very smooth gradients may need a wider `context_overlap`.
+- In `tile by tile`, tiles are refined one after another in raster order (upstream's base engine). A seam is hidden by context rings, a thin directional feather, a minimum-error cut and a DC match, not prevented. Very smooth gradients may need a wider `context_overlap`.
 - On the final step, and on intermediate steps the planner could not snap within `aspect_tolerance`, the last tile of an axis can be narrower than the others.
 - `plan_only` still runs the nodes upstream of it (model and text encoder loading), since ComfyUI executes the inputs first.
 - An upscale model runs only on step 1. A fixed 4x model on a large source can still produce a big image there; the plan warns above 40 MP.
-- Randomly shifted tile grids per step (TiledKSampler-style) are not implemented yet. The grid code is kept separate from the planner so that such a tile mode can be added later.
+- The `all at once` modes take no `mask` and no ControlNet. They need a guider that keeps its options in `model_options` (CFGGuider and core's guiders do); with any other guider the run stops with an error after the first step instead of running the model untiled.
 
 ## Tests
 
