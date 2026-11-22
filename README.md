@@ -36,31 +36,45 @@ Both nodes are wired like `SamplerCustomAdvanced`: a `GUIDER` (for example `CFGG
 
 ### Stepwise Tile Upscale
 
-Upscales in several steps. Each step enlarges the whole image in pixel space and then refines it tile by tile, with the denoise falling from the first step to the last.
+Upscales in several steps. Each step enlarges the whole image in pixel space and then refines it tile by tile, with the strength (start noise level, or denoise) falling from the first step to the last.
 
 | Input | What it does |
 |---|---|
 | `image`, `guider`, `sampler`, `noise`, `vae` | As for `SamplerCustomAdvanced`. The VAE's latent scale is read automatically. |
-| `scheduler`, `steps` | Each step's sigmas are built like `BasicScheduler` with that step's denoise. |
-| `upscale_by` | Total enlargement. The final size is `round(input × upscale_by)` on each axis, exactly. |
-| `upscale_steps` | Number of enlarge + refine steps. `0` picks the fewest steps whose factor stays at or under `auto_step_factor` (1.5), e.g. 2 steps for x2 and 3 for x3. |
+| `scheduler`, `steps` | How each step's noise levels are spaced, and how many sampler steps each tile gets. See [Noise level or denoise](#noise-level-or-denoise). |
+| `upscale_by` | Output size: the final image is exactly `round(input × upscale_by)` on each axis. `1` keeps the input size. |
+| `oversample` | Runs the refine passes this much larger than the output track and shrinks onto the exact output size after the last pass. The largest pass is `input × upscale_by × oversample`. `1` is off. See [The repair loop](#the-repair-loop). |
+| `oversample_mode` | `constant`: the first pass jumps to the oversample and every pass keeps it. `ramp up`: the passes grow evenly and reach it on the last pass. |
+| `upscale_steps` | Number of refine passes. `0` picks the fewest whose growth per pass stays at or under `auto_step_factor` (1.5), e.g. 2 steps for x2 and 3 for x3. |
+| `upscale_method` / `downscale_method` | The filters for enlarging and for the shrink after the last pass, soft to sharp: `bilinear` (enlarge only), `area` (shrink only), `bicubic (B-spline)`, `bicubic (mitchell)`, `bicubic (catmull-rom)`, `lanczos`. Defaults `lanczos` and `area`. |
 | `max_tile_width` / `max_tile_height` | Largest size the model sees per tile, rings included. `0` picks 1024 for SDXL/Flux/MOSS-class models and 768 for SD1.x/2.x. |
 | `context_anchor` / `context_overlap` | Minimum ring widths (frozen context, and the band shared and blended between neighbours). They are rounded up to whole latent cells and the pixel grid. |
-| `denoise_first` / `denoise_last` | Denoise of the first and the last step. The steps in between are interpolated linearly. |
+| `denoise_first` / `denoise_last` | Strength of the first and the last step, three decimals. The steps in between are interpolated linearly per step. Since every step enlarges by about the same factor, that is the same drop per factor of size. |
+| `denoise_mode` | `noise level` (default): the two values are the share of noise each step starts from, the same for every scheduler. `denoise`: they are `BasicScheduler` denoise values. The plan shows both for every step. |
 | `plan_only` | Computes and outputs the plan without sampling, so you can check it before a long run. |
-| `upscale_model` (optional) | Used for the first step only, then lanczos to that step's exact size. Later steps use lanczos, so a 4x model never runs on a large intermediate. |
+| `upscale_model` (optional) | Used for the first step only, then `upscale_method` to that step's exact size. Later steps use `upscale_method` only, so a 4x model never runs on a large intermediate. |
 | `aspect_tolerance` (advanced) | How much aspect-ratio deviation (percent) an intermediate step may take to get tiles of equal size. `0` keeps the closest exact enlargement. The final step is always exact. |
 | `auto_step_factor`, `latent_scale`, `pixel_multiple` (advanced) | See [How the steps are planned](#how-the-steps-are-planned) and [Other models](#other-models). |
 
 Outputs: the final `image`, `step_images` (the result of every step, as a list since the sizes differ) and `plan`, a Markdown table that is also written to the log. Connect `plan` to *Preview as Text* in Markdown mode.
 
-Example plan, MOSS-Image, 1280x960 x3 in 3 steps:
+Example plan, MOSS-Image, 1280x960 x3, auto steps, noise level 0.35 -> 0.25:
 
-| Step | Size | Factor x / y | Aspect dev | Tiles | Core px (w x h) | Sampled px (w x h) | Denoise | Enlarge | Size choice |
+| Step | Size | Factor x / y | Aspect dev | Tiles | Core px (w x h) | Sampled px (w x h) | Noise level | Enlarge | Size choice |
 |---|---|---|---|---|---|---|---|---|---|
-| 1 | 1280x960 -> 1824x1376 | 1.425 / 1.433 | -0.58% | 2x2 = 4 | 912 x 688 | 976 x 752 | 0.450 | lanczos | even tiles |
-| 2 | 1824x1376 -> 2688x2016 | 1.474 / 1.465 | +0.00% | 3x3 = 9 | 896 x 672 | 1024/960 x 800/736 | 0.335 | lanczos | even tiles |
-| 3 | 2688x2016 -> 3840x2880 | 1.429 / 1.429 | +0.00% | 5x4 = 20 | 768 x 720 | 896/832 x 848/784 | 0.220 | lanczos | final (exact) |
+| 1 | 1280x960 -> 1824x1376 | 1.425 / 1.433 | -0.58% | 2x2 = 4 | 912 x 688 | 976 x 752 | 0.350 | lanczos | even tiles |
+| 2 | 1824x1376 -> 2688x2016 | 1.474 / 1.465 | +0.00% | 3x3 = 9 | 896 x 672 | 1024/960 x 800/736 | 0.300 | lanczos | even tiles |
+| 3 | 2688x2016 -> 3840x2880 | 1.429 / 1.429 | +0.00% | 5x4 = 20 | 768 x 720 | 896/832 x 848/784 | 0.250 | lanczos | final (exact) |
+
+| Step | Setting | Start noise level | Start sigma | Same as denoise | Schedule |
+|---|---|---|---|---|---|
+| 1 | noise level 0.350 | 0.349 | 0.3494 | 0.0969 | last 26 of 259 sigmas |
+| 2 | noise level 0.300 | 0.300 | 0.3002 | 0.0781 | last 26 of 321 sigmas |
+| 3 | noise level 0.250 | 0.252 | 0.2516 | 0.0620 | last 26 of 404 sigmas |
+
+### Noise Level Scheduler
+
+`BasicScheduler` with the start noise level as its setting instead of denoise (category `sampling/custom_sampling/schedulers`). It outputs `SIGMAS` for any sampler node, plus an `info` string with the denoise it equals. Use it with *Tile Refine (Any VAE)*, `SamplerCustom` or other upscalers.
 
 ### Tile Refine (Any VAE)
 
@@ -68,10 +82,46 @@ Upstream's base node (*Context-Anchored Tile Refine*) with the latent scale read
 
 ## How the steps are planned
 
-1. The final size is `round(source × factor)`. There is no rounding to 64 and no stretch.
+1. The final size is `round(source × upscale_by)`. There is no rounding to 64 and no stretch.
 2. Each step enlarges by about `factor^(1/steps)`. The intermediate sizes are a trade-off between an even factor per step, the right aspect ratio, and sizes where each axis splits into a whole number of **equal** tiles whose cores and sampled crops are multiples of the pixel grid and fit under the tile cap. Within `aspect_tolerance` the planner picks such a size. Otherwise it takes a grid-multiple size, and with tolerance 0 the closest exact enlargement (reflect-padded to the grid and cropped back, so the last tile of an axis can be narrower). The plan shows the factor and the aspect deviation of every step.
 3. Tiles are never resampled. A tile is cut from the canvas, sampled and pasted back at its native size.
-4. Denoise goes linearly from `denoise_first` to `denoise_last`, applied through the sigmas like `BasicScheduler`.
+4. The strength goes linearly per step from `denoise_first` to `denoise_last`, as a noise level or a `BasicScheduler` denoise (`denoise_mode`).
+
+## The repair loop
+
+Enlarging makes small objects bigger in pixels, and the tiles then redraw them well. That repairs AI deformities in small objects. `oversample` uses this: the refine passes run `oversample` times larger than the output track, and one resample after the last pass brings the image onto the exact output size. The largest pass is the last, at `input × upscale_by × oversample`.
+
+- `constant`: pass *i* runs at `upscale_by^(i/steps) × oversample`. Each pass is "enlarge by U, refine, shrink by D" with U = `upscale_by^(1/steps) × oversample` and D = `oversample`. Between two passes the shrink and the next enlargement are one resample, which tested on MOSS-Image as good as doing them apart and less soft. At `upscale_by` 1 every pass runs at one size.
+- `ramp up`: pass *i* runs at `(upscale_by × oversample)^(i/steps)`, growing evenly to the largest size.
+
+Set `denoise_first` = `denoise_last` for a constant noise level. Recipes, 5 steps:
+
+| Recipe | upscale_by | oversample | oversample_mode |
+|---|---|---|---|
+| enlarge x1.5, refine, shrink back, five times | 1 | 1.5 | constant |
+| grow slowly to x1.5, then shrink back once | 1 | 1.5 | ramp up |
+| x2 with a repair in every pass (about x1.49 up, /1.3 down per pass) | 2 | 1.3 | constant |
+| x2 through x3, area down at the end | 2 | 1.5 | ramp up |
+
+Each pass draws its noise on seed + step − 1, so passes at the same size never reuse each other's noise. Same-seed passes reproduce each other's invented detail and overcook the image.
+
+Every shrink widens its filter by the shrink factor, so all source pixels count however large the reduction ("precise" resampling). `area` is the exact mean of the covered pixels and never rings. The bicubic variants are the Mitchell–Netravali family: B-spline is the softest with no ringing, Catmull-Rom (PIL's "bicubic") the sharpest. `lanczos` is core's.
+
+## Noise level or denoise
+
+`BasicScheduler` turns a denoise value into sigmas by scheduling `int(steps / denoise)` steps and keeping the last `steps + 1`. Where that tail starts depends on the scheduler and on the model's shift, so the same denoise means very different amounts of noise. On MOSS-Image (flow, shift 5):
+
+| denoise | 0.05 | 0.10 | 0.22 | 0.30 | 0.45 | 0.60 |
+|---|---|---|---|---|---|---|
+| start noise, `simple` | 0.21 | 0.36 | 0.59 | 0.68 | 0.81 | 0.89 |
+| start noise, `beta` | 0.11 | 0.18 | 0.46 | 0.61 | - | - |
+| start noise, `karras` | 0.007 | 0.010 | 0.023 | 0.037 | 0.086 | 0.19 |
+
+`karras` ignores the model's shift, so its low denoise values barely sample at all on flow models.
+
+In `noise level` mode the node searches for the schedule length whose tail starts nearest the requested level, then cuts the tail like `BasicScheduler`. The level is the flow sigma (share of noise in the sample, 0..1); on SD/SDXL-type models it is `sigma / (1 + sigma)`, so it means about the same amount of noise there. The schedule length is a whole number, so the level is hit to within about 0.005 at upscaling levels. Near full noise with `karras` or `exponential` the steps are coarser (0.35 lands on 0.334 with `karras` at 25 steps). The same level does not make two different models change an image by the same amount.
+
+Measured on MOSS-Image, at the same start noise `simple`, `beta`, `euler`, `dpmpp_2m` and `er_sde` gave nearly the same result, and cfg 2 to 4.5 made no measurable difference at these levels. The start noise is what matters.
 
 ## MOSS-Image settings
 
@@ -80,7 +130,7 @@ What the tests in this repository used, and a good starting point:
 - Diffusion model: `moss_image_sft_int8_convrot` (Load Diffusion Model), text encoder `qwen3.5_9b_w4a8_gptq` (Load CLIP, type `moss_image`), VAE `flux2-vae`.
 - `CFGGuider` cfg 3, sampler `er_sde`, scheduler `simple`, 25 steps. Shift 5 is set by the model automatically.
 - Max tile `0` (auto = 1024, about 1 MP per tile, within MOSS's 1-2 MP sweet spot), `context_anchor` 32, `context_overlap` 32.
-- Denoise 0.45 -> 0.22 for a 2-3 step upscale.
+- Noise level 0.35 -> 0.25 (the default). A ground-truth sweep (a MOSS image downscaled, upscaled back in one step and compared with the original) found about 0.21-0.27 per x1.5 step and 0.36-0.40 per x2 step the most that sharpens without changing content. From about 0.47 (denoise 0.15) MOSS starts inventing things (an object in a dark window, redrawn wires), and from about 0.68 (denoise 0.3) skin turns waxy and texture painterly. The tests below ran at the older default, denoise 0.45 -> 0.22 (start noise 0.81 -> 0.59).
 - The positive prompt reaches every tile. Objects it names (say "seagulls") get drawn into any tile with a vaguely matching shape, more so at higher denoise. For upscaling, prefer a prompt that describes the style, medium and lighting rather than the objects, or lower the denoise (0.35 -> 0.18 cut the colour drift of the 3-step test by a fifth).
 - Do not start ComfyUI with `--use-sage-attention`: it produces broken images with MOSS-Image.
 - MOSS's own guide advises against latent upscaling. These nodes enlarge in pixel space and re-encode, as recommended.

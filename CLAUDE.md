@@ -18,6 +18,28 @@ upstream's own.
   is always exact; intermediates prefer sizes that split into equal tiles within
   `aspect_tolerance`. Keep the tile mode separate from the planner: a randomly offset grid per
   step (TiledKSampler-style) is planned as a later, alternative tile mode.
+- THE REPAIR LOOP (2026-11-22): `oversample` (>= 1) and `oversample_mode` on the Stepwise node.
+  `upscale_by` is always the output size (exact; 1 = the input size). The passes run oversample
+  times larger and `UpscalePlan.final` is the ONE resample after the last pass onto the target, so
+  the largest pass is input x upscale_by x oversample. `constant`: pass i at upscale_by^(i/n) x
+  oversample (enlarge U, pass, shrink D = oversample, the shrink and the next enlargement merged;
+  no growth keeps the size exactly, `SIZE_SAME`). `ramp up`: pass i at (upscale_by x
+  oversample)^(i/n). oversample 1 plans exactly as before in both modes. It replaced a
+  downscale_by / final_reset_scale pair the same day, whose totals (1.5^5 for K) were unreadable.
+  Every pass after the first gets seed + index - 1 (`stepwise_nodes.step_noise`): noise is drawn
+  from seed and shape, so same-size passes otherwise reuse identical noise.
+- `resample.py` (torch at module scope): `upscale_method` / `downscale_method`. lanczos is core's
+  (`upscale._lanczos_resize`, bytes unchanged); area / bilinear / BC-cubic are separable float
+  filters, widened by the shrink factor, edge taps dropped and renormalized. Catmull-Rom and
+  bilinear are pinned equal to PIL's float resize in both directions. The widget lists and their
+  order live in `stepwise_plan` (stdlib) and follow the owner's order.
+- `noise_level.py` (stdlib at module scope): the Stepwise node's `denoise_mode` and the
+  `Noise Level Scheduler` node. "noise level" = the start sigma on flow models (sigma/(1+sigma)
+  on eps/v), reached by bisecting the BasicScheduler schedule length (`solve_total`) and cutting
+  the same last steps+1 tail, so a level means the same start noise for every scheduler.
+  "denoise" mode is `upscale.build_sigmas` unchanged. Settled by the 2026-11-08 ground-truth
+  sweep on MOSS: start noise is what matters; scheduler, sampler and cfg barely do at equal start.
+  `denoise_mode` sits right after `denoise_last` (the node was unreleased when it went in).
 - Gate: `COMFYUI_ROOT=<core> <venv> -m pytest tests -m "not gpu"` plus `ruff check .` (0.16.2).
   `tests/test_stepwise.py` is the fork's suite (fake VAEs at 8x, 16x/128 ch and a 32 px grid).
 

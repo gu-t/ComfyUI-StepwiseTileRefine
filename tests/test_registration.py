@@ -30,18 +30,22 @@ def test_loads_via_comfyui_directory_mechanism(loaded_package):
     # beside the original Context-Anchored Tile Refine without a name clash.
     upscale_class = loaded_package.NODE_CLASS_MAPPINGS["StepwiseTileUpscale"]
     refine_class = loaded_package.NODE_CLASS_MAPPINGS["StepwiseTileRefineAnyVAE"]
+    scheduler_class = loaded_package.NODE_CLASS_MAPPINGS["StepwiseNoiseLevelScheduler"]
     assert isinstance(upscale_class, type)
     assert isinstance(refine_class, type)
     assert {
         "StepwiseTileUpscale": upscale_class,
         "StepwiseTileRefineAnyVAE": refine_class,
+        "StepwiseNoiseLevelScheduler": scheduler_class,
     } == loaded_package.NODE_CLASS_MAPPINGS
     assert loaded_package.NODE_DISPLAY_NAME_MAPPINGS == {
         "StepwiseTileUpscale": "Stepwise Tile Upscale",
         "StepwiseTileRefineAnyVAE": "Tile Refine (Any VAE)",
+        "StepwiseNoiseLevelScheduler": "Noise Level Scheduler",
     }
-    for node_class in loaded_package.NODE_CLASS_MAPPINGS.values():
-        assert node_class.CATEGORY == "image/upscaling/stepwise"
+    assert upscale_class.CATEGORY == refine_class.CATEGORY == "image/upscaling/stepwise"
+    # The scheduler sits beside core's BasicScheduler.
+    assert scheduler_class.CATEGORY == "sampling/custom_sampling/schedulers"
     assert "NODE_CLASS_MAPPINGS" in loaded_package.__all__
     assert "NODE_DISPLAY_NAME_MAPPINGS" in loaded_package.__all__
 
@@ -298,6 +302,7 @@ def test_requirements_txt_matches_pyproject_dependencies():
 @pytest.mark.parametrize("module, banned", [
     ("geometry", ("comfy", "torch")),
     ("stepwise_plan", ("comfy", "torch")),
+    ("noise_level", ("comfy", "torch")),
     ("stepwise_nodes", ("comfy", "latent_preview")),
 ])
 def test_fork_modules_keep_the_import_contract(module, banned):

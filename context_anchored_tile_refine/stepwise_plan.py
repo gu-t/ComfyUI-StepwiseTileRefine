@@ -12,7 +12,21 @@ trade three goals against each other:
 
 `aspect_tolerance` is the one knob: the largest aspect deviation an intermediate may take to
 reach a nice size. 0 asks for the closest exact enlargement instead, and the refine then
-reflect-pads to the grid and crops back, so the last tile of an axis may be narrower."""
+reflect-pads to the grid and crops back, so the last tile of an axis may be narrower.
+
+OVERSAMPLE (the repair loop). `factor` is always the output size. `oversample` (>= 1) runs the
+passes that much larger, and ONE final resample after the last pass brings the image onto the
+exact target, so the largest pass is source * factor * oversample. Two ways to get there:
+
+    constant    pass i at source * factor ** (i / steps) * oversample: the first pass jumps to
+                the oversample and every pass keeps it. Per pass that is the enlarge-by-U, refine,
+                shrink-by-D loop with U = factor ** (1 / steps) * oversample and D = oversample,
+                the shrink and the next enlargement merged into one resample (tested as good as
+                the two apart, and less soft). factor 1 refines at one size every pass.
+    ramp up     pass i at source * (factor * oversample) ** (i / steps): the passes grow evenly
+                and reach the oversample on the last pass.
+
+oversample 1 is the plain upscale in both modes and plans exactly as it always did."""
 import math
 from dataclasses import dataclass, field
 
@@ -30,6 +44,35 @@ SIZE_EVEN = "even tiles"
 SIZE_GRID = "grid multiple"
 SIZE_EXACT = "exact (padded)"
 SIZE_FINAL = "final (exact)"
+SIZE_SAME = "same size"
+
+# The resample methods (resample.py), in the order the widgets list them: the simple filters,
+# then the BC-cubic family soft to sharp, then lanczos. Area enlarges like nearest neighbour,
+# and bilinear adds nothing between B-spline and Mitchell when shrinking.
+UPSCALE_METHODS = ("bilinear", "bicubic (B-spline)", "bicubic (mitchell)", "bicubic (catmull-rom)", "lanczos")
+DOWNSCALE_METHODS = ("area", "bicubic (B-spline)", "bicubic (mitchell)", "bicubic (catmull-rom)", "lanczos")
+DEFAULT_UPSCALE_METHOD = "lanczos"
+OVERSAMPLE_CONSTANT = "constant"
+OVERSAMPLE_RAMP = "ramp up"
+OVERSAMPLE_MODES = (OVERSAMPLE_CONSTANT, OVERSAMPLE_RAMP)
+DEFAULT_DOWNSCALE_METHOD = "area"
+
+
+def resample_method(src_w, src_h, width, height, upscale_method, downscale_method):
+    # A resample that shrinks both axes (or keeps one) uses the downscale method, anything that
+    # enlarges an axis the upscale method.
+    if width <= src_w and height <= src_h:
+        return downscale_method
+    return upscale_method
+
+
+@dataclass(frozen=True)
+class FinalResample:
+    src_width: int
+    src_height: int
+    width: int
+    height: int
+    method: str
 
 
 @dataclass(frozen=True)
@@ -71,6 +114,7 @@ class StepPlan:
     use_model: bool
     size_choice: str
     warnings: tuple = ()
+    method: str = DEFAULT_UPSCALE_METHOD   # the resample onto this step's size (after the model, if any)
 
     @property
     def factor_x(self):
@@ -100,6 +144,9 @@ class UpscalePlan:
     aspect_tolerance: float
     steps: tuple
     notes: tuple = field(default=())
+    oversample: float = 1.0
+    oversample_mode: str = OVERSAMPLE_CONSTANT
+    final: FinalResample = None   # the resample after the last pass, None when that pass is the target
 
     def aspect_deviation(self, width, height):
         return (width / height) / (self.src_width / self.src_height) - 1.0
@@ -174,34 +221,55 @@ def _choose_size(ideal_w, ideal_h, src_aspect, prev_w, prev_h, cap_w, cap_h, anc
 def plan_upscale(src_width, src_height, factor, steps, geometry, cap_width, cap_height,
                  context_anchor, context_overlap, denoise_start, denoise_end,
                  aspect_tolerance=0.01, upscale_model_scale=None,
-                 auto_step_factor=DEFAULT_AUTO_STEP_FACTOR):
+                 auto_step_factor=DEFAULT_AUTO_STEP_FACTOR, oversample=1.0, oversample_mode=OVERSAMPLE_CONSTANT,
+                 upscale_method=DEFAULT_UPSCALE_METHOD, downscale_method=DEFAULT_DOWNSCALE_METHOD):
     """The full plan. `steps` 0 picks the count automatically (auto_step_count). The rings are
     the minimums the caller asked for, snapped onto the geometry (geometry.snap_rings), and are
     the same on every step. `upscale_model_scale` is the connected upscale model's fixed factor,
-    or None for lanczos only; the model runs on step 1 only."""
+    or None for none; the model runs on step 1 only. `oversample` and `oversample_mode` are the
+    repair loop (module docstring); the two methods only name the resamples here."""
     if src_width < 1 or src_height < 1:
         raise ValueError(f"source size must be positive, got {src_width}x{src_height}")
     if not factor > 0:
         raise ValueError(f"factor must be positive, got {factor}")
+    if not oversample >= 1.0:
+        raise ValueError(f"oversample must be at least 1, got {oversample:g}")
+    if oversample_mode not in OVERSAMPLE_MODES:
+        raise ValueError(f"oversample_mode must be one of {list(OVERSAMPLE_MODES)}, got {oversample_mode!r}")
+    for name, value, allowed in (("upscale_method", upscale_method, UPSCALE_METHODS),
+                                 ("downscale_method", downscale_method, DOWNSCALE_METHODS)):
+        if value not in allowed:
+            raise ValueError(f"{name} must be one of {list(allowed)}, got {value!r}")
     target_w = max(1, round(src_width * factor))
     target_h = max(1, round(src_height * factor))
-    n_steps = int(steps) if steps and steps > 0 else auto_step_count(factor, auto_step_factor)
+    n_steps = int(steps) if steps and steps > 0 else auto_step_count(factor * oversample, auto_step_factor)
     anchor, overlap = snap_rings(context_anchor, context_overlap, geometry)
     denoises = interpolate_denoise(denoise_start, denoise_end, n_steps)
     src_aspect = src_width / src_height
+    ramp = oversample_mode == OVERSAMPLE_RAMP
+    plain = oversample == 1.0
+    # Growth from one pass to the next. Only without oversampling does the last pass land on the
+    # target itself; otherwise the final resample follows it.
+    growth = (factor * oversample if ramp else factor) ** (1.0 / n_steps)
     notes = []
     if (anchor, overlap) != (context_anchor, context_overlap):
         notes.append(f"rings rounded up to anchor {anchor} / overlap {overlap} px for the {geometry.multiple} px grid")
     if n_steps > 1 and factor <= 1.0:
         notes.append("factor <= 1: every step after the first refines at the same size")
+    if n_steps > 1 and not plain and abs(growth - 1.0) < 1e-9:
+        notes.append("every pass refines at the same size (repair loop)")
 
     plan_steps = []
     prev_w, prev_h = src_width, src_height
     for i in range(1, n_steps + 1):
-        scale = factor ** (i / n_steps)
+        scale = (factor * oversample) ** (i / n_steps) if ramp else factor ** (i / n_steps) * oversample
         ideal_w, ideal_h = src_width * scale, src_height * scale
-        if i == n_steps or factor <= 1.0:
+        if plain and (factor <= 1.0 or i == n_steps):
             width, height, choice = target_w, target_h, SIZE_FINAL
+        elif i > 1 and abs(growth - 1.0) < 1e-9:
+            # No growth between passes (constant oversample at factor 1): the pass keeps the
+            # previous size exactly, since a near-identity resample would only soften it.
+            width, height, choice = prev_w, prev_h, SIZE_SAME
         else:
             width, height, choice = _choose_size(ideal_w, ideal_h, src_aspect, prev_w, prev_h, cap_width,
                                                  cap_height, anchor, overlap, geometry, aspect_tolerance)
@@ -212,16 +280,16 @@ def plan_upscale(src_width, src_height, factor, steps, geometry, cap_width, cap_
         use_model = upscale_model_scale is not None and i == 1
         if use_model:
             mw, mh = round(prev_w * upscale_model_scale), round(prev_h * upscale_model_scale)
+            method = resample_method(mw, mh, width, height, upscale_method, downscale_method)
             if (mw, mh) == (width, height):
                 upscale = f"model x{upscale_model_scale:g}"
             else:
-                upscale = f"model x{upscale_model_scale:g} ({mw}x{mh}) + lanczos"
+                upscale = f"model x{upscale_model_scale:g} ({mw}x{mh}) + {method}"
             if mw * mh / 1e6 > MODEL_OUTPUT_WARN_MP:
                 warnings.append(f"upscale model output {mw}x{mh} is {mw * mh / 1e6:.1f} MP")
-        elif (width, height) == (prev_w, prev_h):
-            upscale = "none (same size)"
         else:
-            upscale = "lanczos"
+            method = resample_method(prev_w, prev_h, width, height, upscale_method, downscale_method)
+            upscale = "none (same size)" if (width, height) == (prev_w, prev_h) else method
         for g, name in ((gx, "column"), (gy, "row")):
             if not g.even and g.n > 1:
                 warnings.append(f"last {name} core {g.last} px vs {g.base} px")
@@ -233,14 +301,18 @@ def plan_upscale(src_width, src_height, factor, steps, geometry, cap_width, cap_
             index=i, src_width=prev_w, src_height=prev_h, width=width, height=height,
             ideal_width=ideal_w, ideal_height=ideal_h, grid_x=gx, grid_y=gy,
             denoise=float(denoises[i - 1]), upscale=upscale, use_model=use_model,
-            size_choice=choice, warnings=tuple(warnings)))
+            size_choice=choice, warnings=tuple(warnings), method=method))
         prev_w, prev_h = width, height
 
+    final = None
+    if (prev_w, prev_h) != (target_w, target_h):
+        final = FinalResample(prev_w, prev_h, target_w, target_h,
+                              resample_method(prev_w, prev_h, target_w, target_h, upscale_method, downscale_method))
     return UpscalePlan(
         src_width=src_width, src_height=src_height, width=target_w, height=target_h, factor=factor,
         geometry=geometry, cap_width=cap_width, cap_height=cap_height, context_anchor=anchor,
         context_overlap=overlap, aspect_tolerance=aspect_tolerance, steps=tuple(plan_steps),
-        notes=tuple(notes))
+        notes=tuple(notes), oversample=float(oversample), oversample_mode=oversample_mode, final=final)
 
 
 def _fmt_axis_sizes(gx, gy):
@@ -253,20 +325,36 @@ def _fmt_sampled(gx, gy):
     return f"{'/'.join(str(s) for s in gx.sampled())} x {'/'.join(str(s) for s in gy.sampled())}"
 
 
-def format_plan(plan, sampler_steps=None):
+def format_plan(plan, sampler_steps=None, value_label="Denoise"):
     """The plan as Markdown: a header, one table row per step, then warnings and notes."""
     g = plan.geometry
+    n = len(plan.steps)
+    scale_text = f"x{plan.factor:g}"
+    if plan.oversample != 1.0:
+        scale_text += f", oversample x{plan.oversample:g} {plan.oversample_mode}"
     lines = [
         "## Stepwise Tile Upscale plan",
         "",
         f"- Source {plan.src_width}x{plan.src_height} -> target {plan.width}x{plan.height} "
-        f"(x{plan.factor:g}), {len(plan.steps)} step{'s' if len(plan.steps) != 1 else ''}",
+        f"({scale_text}), {n} step{'s' if n != 1 else ''}",
         f"- Latent cell {g.scale} px, pixel grid {g.multiple} px, max tile {plan.cap_width}x{plan.cap_height} px "
         f"(sampled crop incl. rings)",
         f"- Rings: context_anchor {plan.context_anchor} px, context_overlap {plan.context_overlap} px; "
         f"aspect tolerance {plan.aspect_tolerance * 100:g}%",
+    ]
+    if plan.oversample != 1.0:
+        over, last = plan.oversample, plan.steps[-1]
+        if plan.oversample_mode == OVERSAMPLE_RAMP:
+            grow = (plan.factor * over) ** (1.0 / n)
+            lines.append(f"- The passes grow by x{grow:.4f} each to x{plan.factor * over:.4g} ({last.width}x{last.height}), "
+                         f"then one shrink /{over:g} onto the target")
+        else:
+            grow = plan.factor ** (1.0 / n)
+            lines.append(f"- Each pass: enlarge x{grow * over:.4f}, refine, shrink /{over:g} (between passes merged "
+                         f"into one resample x{grow:.4f}); largest pass {last.width}x{last.height}")
+    lines += [
         "",
-        "| Step | Size | Factor x / y | Aspect dev | Tiles | Core px (w x h) | Sampled px (w x h) | Denoise | Enlarge | Size choice |",
+        f"| Step | Size | Factor x / y | Aspect dev | Tiles | Core px (w x h) | Sampled px (w x h) | {value_label} | Enlarge | Size choice |",
         "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for s in plan.steps:
@@ -275,6 +363,12 @@ def format_plan(plan, sampler_steps=None):
             f"| {s.index} | {s.src_width}x{s.src_height} -> {s.width}x{s.height} | {s.factor_x:.3f} / {s.factor_y:.3f} "
             f"| {aspect:+.2f}% | {s.grid_x.n}x{s.grid_y.n} = {s.tiles} | {_fmt_axis_sizes(s.grid_x, s.grid_y)} "
             f"| {_fmt_sampled(s.grid_x, s.grid_y)} | {s.denoise:.3f} | {s.upscale} | {s.size_choice} |")
+    f = plan.final
+    if f is not None:
+        lines.append(
+            f"| final | {f.src_width}x{f.src_height} -> {f.width}x{f.height} | {f.width / f.src_width:.3f} / "
+            f"{f.height / f.src_height:.3f} | {plan.aspect_deviation(f.width, f.height) * 100:+.2f}% | - | - | - | - "
+            f"| {f.method} | {SIZE_FINAL} |")
     total = f"- Total {plan.total_tiles} tiles"
     if sampler_steps:
         total += f" x {sampler_steps} sampler steps"

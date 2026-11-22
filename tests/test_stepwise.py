@@ -330,7 +330,8 @@ def test_stepwise_plan_only_samples_nothing(comfy_stubs):
 def test_stepwise_denoise_drives_the_sigmas(comfy_stubs):
     # build_sigmas schedules int(steps / denoise) and keeps the last steps + 1, like BasicScheduler.
     StepwiseTileUpscale().upscale(_smooth_image(120, 160), _stepwise_guider(), object(), ZeroNoise(), ScaleVAE(16, 128),
-                                  "simple", 10, 2.0, 2, 256, 256, 32, 32, 0.5, 0.25, False)
+                                  "simple", 10, 2.0, 2, 256, 256, 32, 32, 0.5, 0.25, False,
+                                  denoise_mode="denoise")
     totals = [call[2] for call in comfy_stubs["calculate_sigmas_calls"]]
     assert totals == [20, 40]
 
@@ -351,3 +352,175 @@ def test_validate_inputs():
     assert StepwiseTileUpscale.VALIDATE_INPUTS(1024, 768, 0, 0) is True
     assert isinstance(StepwiseTileUpscale.VALIDATE_INPUTS(100, 0, 32, 32), str)
     assert isinstance(StepwiseTileUpscale.VALIDATE_INPUTS(0, 0, 600, 32), str)
+
+
+# --- the repair loop: oversample, oversample_mode, the resample methods -----------------------
+
+def test_plan_constant_oversample_at_upscale_by_one_refines_at_one_size():
+    # K: pass 1 enlarges by the oversample, every later pass keeps that size exactly, and the
+    # final resample shrinks back onto the source size.
+    plan = stepwise_plan.plan_upscale(1152, 864, 1.0, 5, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.7, 0.7, 0.01,
+                                      oversample=1.5)
+    assert (plan.width, plan.height) == (1152, 864)
+    first = (plan.steps[0].width, plan.steps[0].height)
+    assert abs(first[0] / 1152 - 1.5) < 0.07
+    assert all((s.width, s.height) == first for s in plan.steps)
+    assert all(s.size_choice == stepwise_plan.SIZE_SAME for s in plan.steps[1:])
+    assert [s.upscale for s in plan.steps[1:]] == ["none (same size)"] * 4
+    assert plan.final == stepwise_plan.FinalResample(*first, 1152, 864, "area")
+    assert any("same size" in n for n in plan.notes)
+
+
+def test_plan_ramp_up_grows_to_the_oversample():
+    # G: the passes grow evenly to x1.5 and the final resample brings the image back to its
+    # exact source size.
+    plan = stepwise_plan.plan_upscale(1152, 864, 1.0, 5, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.7, 0.7, 0.01,
+                                      oversample=1.5, oversample_mode="ramp up", downscale_method="bicubic (mitchell)")
+    sizes = [(s.width, s.height) for s in plan.steps]
+    assert all(b[0] > a[0] and b[1] > a[1] for a, b in itertools.pairwise([(1152, 864), *sizes]))
+    assert abs(sizes[-1][0] / 1152 - 1.5) < 0.07
+    assert (plan.final.width, plan.final.height, plan.final.method) == (1152, 864, "bicubic (mitchell)")
+    assert (plan.width, plan.height) == (1152, 864)
+
+
+@pytest.mark.parametrize("mode", ["constant", "ramp up"])
+def test_plan_oversampled_upscale(mode):
+    # x2 out, oversample 1.3: the largest pass is the last at about x2.6, then one shrink onto
+    # exactly round(source x 2).
+    plan = stepwise_plan.plan_upscale(1000, 750, 2.0, 5, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.7, 0.5, 0.0,
+                                      oversample=1.3, oversample_mode=mode, upscale_method="bicubic (catmull-rom)")
+    assert (plan.width, plan.height) == (2000, 1500)
+    if mode == "constant":
+        ideal = [1000 * 2.0 ** (i / 5) * 1.3 for i in range(1, 6)]
+    else:
+        ideal = [1000 * 2.6 ** (i / 5) for i in range(1, 6)]
+    assert [s.width for s in plan.steps] == [round(x) for x in ideal]
+    assert max(s.width for s in plan.steps) == plan.steps[-1].width == 2600
+    assert all(s.method == "bicubic (catmull-rom)" for s in plan.steps)
+    assert plan.final == stepwise_plan.FinalResample(2600, 1950, 2000, 1500, "area")
+    text = stepwise_plan.format_plan(plan, 12)
+    assert f"oversample x1.3 {mode}" in text and "| final |" in text and "2600x1950" in text
+
+
+def test_plan_constant_oversample_is_the_enlarge_refine_shrink_loop():
+    # Per pass enlarge by U = 2 ** (1/5) * 1.3, shrink by D = 1.3, the two merged between passes.
+    plan = stepwise_plan.plan_upscale(1000, 750, 2.0, 5, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.7, 0.5, 0.0,
+                                      oversample=1.3)
+    text = stepwise_plan.format_plan(plan)
+    assert f"enlarge x{2 ** 0.2 * 1.3:.4f}, refine, shrink /1.3" in text
+
+
+def test_plan_plain_upscale_has_no_final_resample():
+    plan = stepwise_plan.plan_upscale(1280, 960, 3.0, 3, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.45, 0.22, 0.01)
+    assert plan.final is None and plan.oversample == 1.0
+    assert "| final |" not in stepwise_plan.format_plan(plan)
+    ramp = stepwise_plan.plan_upscale(1280, 960, 3.0, 3, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.45, 0.22,
+                                      0.01, oversample_mode="ramp up")
+    assert ramp.steps == plan.steps
+
+
+def test_plan_auto_steps_count_the_oversample():
+    plan = stepwise_plan.plan_upscale(1000, 750, 2.0, 0, EIGHT, 1024, 1024, 32, 32, 0.5, 0.5, 0.01, oversample=1.5)
+    assert len(plan.steps) == stepwise_plan.auto_step_count(3.0) == 3
+
+
+@pytest.mark.parametrize("kwargs, match", [
+    ({"oversample": 0.9}, "oversample"), ({"oversample_mode": "jump"}, "oversample_mode"),
+    ({"upscale_method": "area"}, "upscale_method"), ({"downscale_method": "bilinear"}, "downscale_method"),
+])
+def test_plan_rejects_bad_repair_inputs(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        stepwise_plan.plan_upscale(800, 600, 2.0, 2, EIGHT, 1024, 1024, 32, 32, 0.5, 0.5, 0.01, **kwargs)
+
+
+def test_widget_method_lists_match_the_resampler(comfy_stubs):
+    from context_anchored_tile_refine import resample
+
+    assert set(stepwise_plan.UPSCALE_METHODS) | set(stepwise_plan.DOWNSCALE_METHODS) == set(resample.METHODS)
+    types = StepwiseTileUpscale.INPUT_TYPES()["required"]
+    assert types["upscale_method"][0] == list(stepwise_plan.UPSCALE_METHODS)
+    assert types["downscale_method"][0] == list(stepwise_plan.DOWNSCALE_METHODS)
+    assert types["oversample_mode"][0] == list(stepwise_plan.OVERSAMPLE_MODES)
+    assert types["upscale_by"][1]["min"] == 1.0 and types["oversample"][1]["min"] == 1.0
+
+
+def test_resample_area_is_the_block_mean():
+    from context_anchored_tile_refine import resample
+
+    image = torch.rand(1, 96, 132, 3, generator=torch.Generator().manual_seed(1))
+    out = resample.resize(image, 44, 32, resample.AREA)
+    assert torch.allclose(out, image.reshape(1, 32, 3, 44, 3, 3).mean((2, 4)), atol=1e-6)
+
+
+@pytest.mark.parametrize("size", [(87, 65), (40, 30), (13, 9), (200, 150)])
+def test_resample_matches_pil_for_catmull_rom_and_bilinear(size):
+    # PIL's float-mode BICUBIC (Keys a = -0.5, widened when shrinking) and BILINEAR are the same
+    # filters, so both directions must agree to float precision.
+    import numpy as np
+    from PIL import Image
+
+    from context_anchored_tile_refine import resample
+
+    image = torch.rand(1, 97, 131, 3, generator=torch.Generator().manual_seed(2))
+    w, h = size
+    for method, pil_filter in ((resample.CATMULL_ROM, Image.Resampling.BICUBIC),
+                               (resample.BILINEAR, Image.Resampling.BILINEAR)):
+        ref = np.stack([np.asarray(Image.fromarray(image[0, ..., c].numpy(), "F").resize((w, h), pil_filter))
+                        for c in range(3)], -1)
+        out = resample.resize(image, w, h, method)[0].numpy()
+        assert np.abs(out - np.clip(ref, 0, 1)).max() < 1e-5, method
+
+
+@pytest.mark.parametrize("method", ["area", "bilinear", "bicubic (B-spline)", "bicubic (mitchell)", "bicubic (catmull-rom)"])
+@pytest.mark.parametrize("size", [(23, 17), (140, 100), (70, 51)])
+def test_resample_keeps_a_flat_image_flat(method, size):
+    from context_anchored_tile_refine import resample
+
+    out = resample.resize(torch.full((1, 50, 70, 3), 0.37), *size, method)
+    assert out.shape == (1, size[1], size[0], 3)
+    assert torch.allclose(out, torch.full_like(out, 0.37), atol=1e-6)
+
+
+def test_resample_same_size_is_the_input():
+    from context_anchored_tile_refine import resample
+
+    image = torch.rand(1, 20, 30, 3)
+    assert resample.resize(image, 30, 20, resample.MITCHELL) is image
+
+
+def test_step_noise_offsets_the_seed_per_pass():
+    from context_anchored_tile_refine.stepwise_nodes import step_noise
+
+    noise = ZeroNoise()
+    assert step_noise(noise, 1) is noise
+    assert [step_noise(noise, i).seed for i in (2, 3)] == [4, 5]
+    assert noise.seed == 3
+    top = SimpleNamespace(seed=(1 << 64) - 1)
+    assert step_noise(top, 2).seed == 0
+    seedless = object()
+    assert step_noise(seedless, 4) is seedless
+
+
+class SeedNoise(ZeroNoise):
+    def __init__(self, log):
+        self.log = log
+
+    def generate_noise(self, input_latent):
+        self.log.append(self.seed)
+        return super().generate_noise(input_latent)
+
+
+@pytest.mark.parametrize("upscale_by, oversample, mode", [(1.0, 1.5, "constant"), (1.0, 1.5, "ramp up"),
+                                                       (2.0, 1.3, "constant")])
+def test_stepwise_node_repair_loop_end_to_end(comfy_stubs, upscale_by, oversample, mode):
+    image = _smooth_image(120, 160)
+    log = []
+    final, step_images, text = StepwiseTileUpscale().upscale(
+        image, _stepwise_guider(), object(), SeedNoise(log), ScaleVAE(16, 128), "simple", 4, upscale_by, 3, 256, 256,
+        32, 32, 0.7, 0.7, False, oversample=oversample, oversample_mode=mode,
+        downscale_method="bicubic (catmull-rom)")
+    assert (final.shape[2], final.shape[1]) == (round(160 * upscale_by), round(120 * upscale_by))
+    assert len(step_images) == 4 and step_images[-1] is final
+    assert "| final |" in text
+    # Each pass draws its noise on its own seed.
+    assert sorted(set(log)) == [3, 4, 5]

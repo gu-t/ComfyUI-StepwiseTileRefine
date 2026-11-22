@@ -58,7 +58,9 @@ def _sampling(g, model, clip, prompt, cfg, sampler, seed):
 
 def stepwise(image_name, prompt, upscale_by, upscale_steps=0, seed=1, steps=25, cfg=3.0, sampler="er_sde",
              scheduler="simple", denoise_first=0.45, denoise_last=0.22, anchor=32, overlap=32, max_tile=0,
-             plan_only=False, aspect_tolerance=1.0, upscale_model=None, prefix="stepwise/out", save_steps=True):
+             denoise_mode="denoise",
+             plan_only=False, aspect_tolerance=1.0, upscale_model=None, prefix="stepwise/out", save_steps=True,
+             oversample=1.0, oversample_mode="constant", upscale_method="lanczos", downscale_method="area"):
     g = Graph()
     model, clip, vae = moss_loaders(g)
     _, _, guider, samp, noise = _sampling(g, model, clip, prompt, cfg, sampler, seed)
@@ -66,8 +68,9 @@ def stepwise(image_name, prompt, upscale_by, upscale_steps=0, seed=1, steps=25, 
     inputs = dict(image=[img, 0], guider=[guider, 0], sampler=[samp, 0], noise=[noise, 0], vae=[vae, 0],
                   scheduler=scheduler, steps=steps, upscale_by=upscale_by, upscale_steps=upscale_steps,
                   max_tile_width=max_tile, max_tile_height=max_tile, context_anchor=anchor,
-                  context_overlap=overlap, denoise_first=denoise_first, denoise_last=denoise_last,
-                  plan_only=plan_only, aspect_tolerance=aspect_tolerance)
+                  context_overlap=overlap, denoise_first=denoise_first, denoise_last=denoise_last, denoise_mode=denoise_mode,
+                  plan_only=plan_only, aspect_tolerance=aspect_tolerance, oversample=oversample,
+                  oversample_mode=oversample_mode, upscale_method=upscale_method, downscale_method=downscale_method)
     if upscale_model:
         um = g.add("UpscaleModelLoader", model_name=upscale_model)
         inputs["upscale_model"] = [um, 0]
