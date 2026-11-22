@@ -276,7 +276,9 @@ def test_any_vae_node_is_bit_identical_to_upstream_at_eight(comfy_stubs, size, r
 def test_any_vae_node_refine_method_matches_upstream_node(comfy_stubs):
     image = torch.rand(1, 600, 520, 3, generator=torch.Generator().manual_seed(9))
     up = ContextAnchoredTileRefine().refine(image, GridGuider(), object(), SIGMAS, GridVAE(), GridNoise(), 256, 256, 32, 32)
-    fork = TileRefineAnyVAE().refine(image, GridGuider(), object(), SIGMAS, GridVAE(), GridNoise(), 256, 256, 32, 32)
+    # tile_size "allow smaller" is upstream's bare windows; the fork's default "always full" grows them.
+    fork = TileRefineAnyVAE().refine(image, GridGuider(), object(), SIGMAS, GridVAE(), GridNoise(), 256, 256, 32, 32,
+                                     tile_size="allow smaller")
     assert torch.equal(up[0], fork[0])
 
 

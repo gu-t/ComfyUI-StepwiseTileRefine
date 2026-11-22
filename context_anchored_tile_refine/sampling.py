@@ -6,7 +6,7 @@ import struct
 
 import torch
 
-from . import captions, conds, grid
+from . import all_at_once, captions, conds, grid
 from .geometry import EIGHT, resolve_geometry, snap_rings
 
 # How a seam is hidden is not configurable, by design: the node exposes only the geometry
@@ -776,7 +776,7 @@ def fold_decoded_frames(decoded):
     return decoded
 
 
-def _refine_tiles(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor, context_overlap, region_pixel=None, *, hint_canvas=None, batch_size=1, batch_index=0, geometry=EIGHT):
+def _refine_tiles(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor, context_overlap, region_pixel=None, *, hint_canvas=None, batch_size=1, batch_index=0, geometry=EIGHT, tile_size=None):
     # Tiled img2img: pad to /8 → solve the grid → encode/sample/decode each tile in
     # raster order from a live canvas → DC-match onto the already-placed neighbors →
     # composite by a directional feather → crop back.
@@ -817,6 +817,11 @@ def _refine_tiles(image, guider, sampler, sigmas, vae, noise, max_tile_width, ma
         region_padded, region_latent = region_gates(region_pixel, canvas_h, canvas_w, scale)
 
     layout = grid.solve_layout(canvas_w, canvas_h, max_tile_width, max_tile_height, context_anchor, context_overlap, multiple=geometry.multiple)
+    if tile_size == all_at_once.SIZE_FULL:
+        # tile_size "always full": each tile's frozen ring grows until the model sees max_tile
+        # (inward at the canvas edge). Core, overlap band and paste rect are unchanged, so the
+        # extra cells are frozen context only, encoded from the live canvas like the ring.
+        layout = grid.grow_layout(layout, geometry.round_down(int(max_tile_width)), geometry.round_down(int(max_tile_height)), geometry.multiple)
     canvas_noise = build_canvas_noise(vae, noise, canvas_h, canvas_w, batch, batch_size, batch_index, latent_scale=scale)
     # Per-tile per-step draws refine every overlap band with two unrelated textures, which the
     # feather then smudges together (tests-AB/probe_raster_noise_band.py).
@@ -988,7 +993,7 @@ def _mask_row(mask, batch_index):
     return mask[row:row + 1]
 
 
-def refine_image(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor, context_overlap, mask=None, vl_clip=None, vlm_method=captions.VLM_METHOD_VISION, anchor_source=None, sampler_name=None, batch_size=1, batch_index=0, progress=None, preset=None, tile_captions=None, layout=None, noise_fields=None, geometry=None):
+def refine_image(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor, context_overlap, mask=None, vl_clip=None, vlm_method=captions.VLM_METHOD_VISION, anchor_source=None, sampler_name=None, batch_size=1, batch_index=0, progress=None, preset=None, tile_captions=None, layout=None, noise_fields=None, geometry=None, tile_mode=None, tile_size=None):
     # Entry point, and the ONE place all three nodes meet. With a vl_clip the whole refine is
     # handed to the sync engine (sync.py) — mask or no mask — and everything below it is the
     # BASE node's raster path.
@@ -1041,9 +1046,38 @@ def refine_image(image, guider, sampler, sigmas, vae, noise, max_tile_width, max
         # already, so it sits ABOVE the picture loop and stays one pure clone.
         return image[..., :3].clone()
 
+    # tile_mode / tile_size (all_at_once.py) are the fork nodes' tile modes. None is upstream's
+    # path exactly: tile by tile with the bare windows. The two all at once modes denoise the whole
+    # canvas as one run, so a region mask, ControlNet hints and the VL engine are not wired into them.
+    mode = all_at_once.TILE_BY_TILE if tile_mode is None else tile_mode
+    if mode not in all_at_once.TILE_MODES:
+        raise ValueError(f"Tile Refine: unknown tile_mode {tile_mode!r}, expected one of {all_at_once.TILE_MODES}")
+    size = all_at_once.SIZE_SMALLER if tile_size is None else tile_size
+    if size not in all_at_once.TILE_SIZES:
+        raise ValueError(f"Tile Refine: unknown tile_size {tile_size!r}, expected one of {all_at_once.TILE_SIZES}")
+    together = mode != all_at_once.TILE_BY_TILE
+    if together:
+        if vl_clip is not None:
+            raise ValueError(f"Tile Refine: the {mode!r} tile mode runs without a VL CLIP.")
+        if mask is not None:
+            raise ValueError(f"Tile Refine: the {mode!r} tile mode does not take a mask yet. Disconnect the mask or use tile by tile.")
+        if conds.has_spatial_conds(getattr(guider, "original_conds", None)):
+            raise ValueError(f"Tile Refine: the {mode!r} tile mode does not support ControlNet. Use tile by tile.")
+    if vl_clip is not None and size != all_at_once.SIZE_SMALLER:
+        raise ValueError("Tile Refine: tile_size reaches the raster path only, the VL engine keeps its own windows.")
+
+    if vl_clip is None and geometry is None:
+        geometry = resolve_geometry(vae)
+    if together and (image.shape[1] < geometry.multiple or image.shape[2] < geometry.multiple):
+        raise ValueError(
+            f"Tile Refine: the image is {image.shape[2]}x{image.shape[1]} px, smaller than the "
+            f"{geometry.multiple} px grid this VAE needs.")
+    if mode == all_at_once.SHIFTING:
+        # The shifting grid's ring is context_anchor alone, on the pixel grid (tile_cells).
+        return _refine_together(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height,
+                                context_anchor, context_overlap, geometry, mode, size, batch_size, batch_index)
+
     if vl_clip is None:
-        if geometry is None:
-            geometry = resolve_geometry(vae)
         snapped = snap_rings(context_anchor, context_overlap, geometry)
         if snapped != (context_anchor, context_overlap):
             logging.info(
@@ -1051,6 +1085,9 @@ def refine_image(image, guider, sampler, sigmas, vae, noise, max_tile_width, max
                 "latent cells and the %d px tile grid.", context_anchor, context_overlap, snapped[0], snapped[1],
                 geometry.scale, geometry.multiple)
             context_anchor, context_overlap = snapped
+        if mode == all_at_once.ALL_AT_ONCE:
+            return _refine_together(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height,
+                                    context_anchor, context_overlap, geometry, mode, size, batch_size, batch_index)
         if image.shape[1] < geometry.multiple or image.shape[2] < geometry.multiple:
             raise ValueError(
                 f"Tile Refine: the image is {image.shape[2]}x{image.shape[1]} px, smaller than the "
@@ -1066,7 +1103,7 @@ def refine_image(image, guider, sampler, sigmas, vae, noise, max_tile_width, max
     # single-picture IMAGE never enters the loop, so its path is untouched.
     if image.shape[0] > 1:
         pictures = [
-            refine_image(image[b:b + 1], guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor, context_overlap, mask=_mask_row(mask, b), vl_clip=vl_clip, vlm_method=vlm_method, anchor_source=anchor_source, sampler_name=sampler_name, batch_size=image.shape[0], batch_index=b, progress=progress, preset=preset, geometry=geometry)
+            refine_image(image[b:b + 1], guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor, context_overlap, mask=_mask_row(mask, b), vl_clip=vl_clip, vlm_method=vlm_method, anchor_source=anchor_source, sampler_name=sampler_name, batch_size=image.shape[0], batch_index=b, progress=progress, preset=preset, geometry=geometry, tile_mode=tile_mode, tile_size=tile_size)
             for b in range(image.shape[0])
         ]
         return torch.cat(pictures, dim=0)
@@ -1114,13 +1151,27 @@ def refine_image(image, guider, sampler, sigmas, vae, noise, max_tile_width, max
         # entirely for a single-picture run, which keeps the caller's own hint tensors.
         if batch_size > 1 and hint_canvas is not None:
             hint_canvas = conds.slice_hint_row(hint_canvas, batch_index)
-        return _refine_tiles(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor, context_overlap, region_pixel=None, hint_canvas=hint_canvas, batch_size=batch_size, batch_index=batch_index, geometry=geometry)
+        return _refine_tiles(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor, context_overlap, region_pixel=None, hint_canvas=hint_canvas, batch_size=batch_size, batch_index=batch_index, geometry=geometry, tile_size=size)
 
     def refine_crop(sub_image, sub_mask, crop_box):
         # The hints take the same bbox slice the image does.
         hint_canvas = conds.prepare_hint_canvas(original_conds, (image.shape[1], image.shape[2]), crop_box) if control_active else None
         if batch_size > 1 and hint_canvas is not None:
             hint_canvas = conds.slice_hint_row(hint_canvas, batch_index)
-        return _refine_tiles(sub_image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor, context_overlap, region_pixel=sub_mask, hint_canvas=hint_canvas, batch_size=batch_size, batch_index=batch_index, geometry=geometry)
+        return _refine_tiles(sub_image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor, context_overlap, region_pixel=sub_mask, hint_canvas=hint_canvas, batch_size=batch_size, batch_index=batch_index, geometry=geometry, tile_size=size)
 
     return refine_masked_region(image, mask, context_anchor, refine_crop, geometry.multiple)
+
+
+def _refine_together(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor,
+                     context_overlap, geometry, tile_mode, tile_size, batch_size=1, batch_index=0):
+    # The all at once modes, one picture at a time like the raster path (all_at_once.py).
+    pictures = [
+        all_at_once.refine_all_at_once(
+            image[b:b + 1], guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor,
+            context_overlap, geometry, tile_mode, tile_size,
+            batch_size=image.shape[0] if image.shape[0] > 1 else batch_size,
+            batch_index=b if image.shape[0] > 1 else batch_index)
+        for b in range(image.shape[0])
+    ]
+    return pictures[0] if len(pictures) == 1 else torch.cat(pictures, dim=0)

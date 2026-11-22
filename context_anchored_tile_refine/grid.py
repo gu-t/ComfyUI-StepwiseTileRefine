@@ -4,6 +4,7 @@ implementation in docs/tile-simulator.html "PURE GRID MATH". Stdlib only.
 Bands per tile, outward from the core: core -> context_overlap (the directional
 feather) -> context_anchor (the frozen halo). The per-seam ring width is
 r = context_overlap + context_anchor."""
+import dataclasses
 import math
 from dataclasses import dataclass
 
@@ -245,6 +246,37 @@ def build_layout(W, H, sx, sy, ctx, overlap=0):
         w=W, h=H, sol_x=sx, sol_y=sy, ctx=ctx, overlap=overlap, r=r,
         tiles=tuple(tiles), total_sampled_px=total_sampled_px, clamped_tiles=clamped_tiles,
     )
+
+
+def grow_span(a, b, length, cap, multiple=8):
+    # Grow the window [a, b) to min(cap, length) inside [0, length): outward evenly (on the
+    # `multiple` grid) where there is room, inward at the canvas edge. A window already that
+    # size, or larger, comes back unchanged.
+    need = min(cap, length) - (b - a)
+    if need <= 0:
+        return a, b
+    lo = (need // multiple // 2) * multiple
+    a, b = a - lo, b + need - lo
+    if a < 0:
+        a, b = 0, b - a
+    if b > length:
+        a, b = a - (b - length), length
+    return max(a, 0), min(b, length)
+
+
+def grow_layout(layout, cap_w, cap_h, multiple=8):
+    # tile_size "always full": every tile's crop_rect (what the model sees) grows to the cap, the
+    # extra cells joining its context ring (frozen in tile by tile, live in all at once). Core,
+    # overlap band and paste rect are unchanged. Sampled sizes and the total follow the crop.
+    tiles = []
+    total = 0
+    for t in layout.tiles:
+        x0, x1 = grow_span(t.crop_rect.x0, t.crop_rect.x1, layout.w, cap_w, multiple)
+        y0, y1 = grow_span(t.crop_rect.y0, t.crop_rect.y1, layout.h, cap_h, multiple)
+        crop = ExpandedRect(x0=x0, y0=y0, x1=x1, y1=y1, clamped=t.crop_rect.clamped)
+        tiles.append(dataclasses.replace(t, crop_rect=crop, sampled_w=x1 - x0, sampled_h=y1 - y0))
+        total += (x1 - x0) * (y1 - y0)
+    return dataclasses.replace(layout, tiles=tuple(tiles), total_sampled_px=total)
 
 
 def solve_layout(W, H, cap_w, cap_h, ctx, overlap=0, multiple=8):
