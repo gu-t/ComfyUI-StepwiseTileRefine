@@ -445,12 +445,12 @@ STEPWISE_ORDER = [
     "denoise_mode", "denoise_first", "denoise_last", "scheduler", "steps",
     "tile_mode", "tile_size", "max_tile_width", "max_tile_height", "tile_overlap", "tile_padding",
     "plan_only",
-    "upscale_model", "aspect_tolerance", "latent_scale", "pixel_multiple",
+    "upscale_model", "aspect_tolerance", "latent_scale", "pixel_multiple", "preview_mode",
 ]
 ANY_VAE_ORDER = [
     "image", "guider", "sampler", "sigmas", "noise", "vae",
     "tile_mode", "tile_size", "max_tile_width", "max_tile_height", "tile_overlap", "tile_padding",
-    "mask", "latent_scale", "pixel_multiple",
+    "mask", "latent_scale", "pixel_multiple", "preview_mode",
 ]
 
 

@@ -12,6 +12,7 @@ from typing import ClassVar
 from .all_at_once import SIZE_FULL, TILE_BY_TILE, TILE_MODE_TOOLTIP, TILE_MODES, TILE_SIZE_TOOLTIP, TILE_SIZES
 from .node import MAX_RESOLUTION, ContextAnchoredTileRefine, _normalize_mask, _validate_image, check_geometry
 from .noise_level import DENOISE_MODES, NOISE_LEVEL
+from .preview import GUESS, PREVIEW_MODE_TOOLTIP, PREVIEW_MODES
 from .stepwise_plan import (
     DEFAULT_DOWNSCALE_METHOD,
     DEFAULT_UPSCALE_METHOD,
@@ -63,6 +64,11 @@ def _tile_inputs(max_tile):
     }
 
 
+def _preview_inputs():
+    # Test phase, appended last on both nodes (the frontend restores widgets_values by position).
+    return {"preview_mode": (list(PREVIEW_MODES), {"default": GUESS, "tooltip": PREVIEW_MODE_TOOLTIP})}
+
+
 def _widget_names(message):
     # Upstream's checks name the engine's arguments. The fork's nodes call them tile_padding and
     # tile_overlap.
@@ -98,7 +104,7 @@ class TileRefineAnyVAE(ContextAnchoredTileRefine):
                 **{name: req[name] for name in ("image", "guider", "sampler", "sigmas", "noise", "vae")},
                 **_tile_inputs({name: req[name] for name in ("max_tile_width", "max_tile_height")}),
             },
-            "optional": {**up.get("optional", {}), **_latent_geometry_inputs()},
+            "optional": {**up.get("optional", {}), **_latent_geometry_inputs(), **_preview_inputs()},
         }
 
     @classmethod
@@ -109,7 +115,7 @@ class TileRefineAnyVAE(ContextAnchoredTileRefine):
     SEARCH_ALIASES: ClassVar[list[str]] = ["tiled refine", "tile refine", "any vae", "moss", "flux2", "16x vae"]
     DESCRIPTION = "Refines an already upscaled image tile by tile. Works with any VAE latent scale (8x, 16x, ...)."
 
-    def refine(self, image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, tile_padding, tile_overlap, mask=None, latent_scale=0, pixel_multiple=0, tile_mode=TILE_BY_TILE, tile_size=SIZE_FULL):
+    def refine(self, image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, tile_padding, tile_overlap, mask=None, latent_scale=0, pixel_multiple=0, tile_mode=TILE_BY_TILE, tile_size=SIZE_FULL, preview_mode=GUESS):
         _validate_image(image)
         message = check_geometry(max_tile_width, max_tile_height, tile_padding, tile_overlap)
         if message is not True:
@@ -120,7 +126,7 @@ class TileRefineAnyVAE(ContextAnchoredTileRefine):
 
         geometry = resolve_run_geometry(vae, latent_scale, pixel_multiple)
         try:
-            return (sampling.refine_image(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, tile_padding, tile_overlap, mask=mask, geometry=geometry, tile_mode=tile_mode, tile_size=tile_size),)
+            return (sampling.refine_image(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, tile_padding, tile_overlap, mask=mask, geometry=geometry, tile_mode=tile_mode, tile_size=tile_size, preview_mode=preview_mode),)
         except grid.GridConfigError as e:
             raise ValueError(_widget_names(str(e))) from e
 
@@ -206,6 +212,7 @@ class StepwiseTileUpscale:
                 "upscale_model": ("UPSCALE_MODEL", {"tooltip": "Optional. Used for the first step only, then upscale_method to that step's exact size."}),
                 "aspect_tolerance": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.1, "advanced": True, "tooltip": "Percent of aspect-ratio deviation an intermediate step may take to land on a size that splits into equal tiles. 0 keeps the closest exact enlargement (the last tile may then be narrower). The final step is always exact."}),
                 **_latent_geometry_inputs(),
+                **_preview_inputs(),
             },
         }
 
@@ -253,7 +260,7 @@ class StepwiseTileUpscale:
                 upscale_model=None, aspect_tolerance=1.0, auto_step_factor=1.5, latent_scale=0, pixel_multiple=0,
                 denoise_mode=NOISE_LEVEL, oversample=1.0, oversample_mode=OVERSAMPLE_CONSTANT,
                 upscale_method=DEFAULT_UPSCALE_METHOD, downscale_method=DEFAULT_DOWNSCALE_METHOD,
-                tile_mode=TILE_BY_TILE, tile_size=SIZE_FULL):
+                tile_mode=TILE_BY_TILE, tile_size=SIZE_FULL, preview_mode=GUESS):
         _validate_image(image)
         message = check_stepwise(max_tile_width, max_tile_height, tile_padding, tile_overlap)
         if message is not True:
@@ -296,7 +303,7 @@ class StepwiseTileUpscale:
             current = sampling.refine_image(
                 current, guider, sampler, schedule.sigmas, vae, step_noise(noise, step.index), plan.cap_width,
                 plan.cap_height, tile_padding if tile_mode == all_at_once.SHIFTING else plan.context_anchor, plan.context_overlap,
-                geometry=plan.geometry, tile_mode=tile_mode, tile_size=tile_size)
+                geometry=plan.geometry, tile_mode=tile_mode, tile_size=tile_size, preview_mode=preview_mode)
             current = current.to(comfy.model_management.intermediate_device())
             if (int(current.shape[2]), int(current.shape[1])) != (step.width, step.height):
                 raise RuntimeError(

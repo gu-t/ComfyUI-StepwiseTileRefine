@@ -237,12 +237,16 @@ class TiledModelWrapper:
     cancel lands within one window rather than one whole step. `calls` counts the model calls it
     has handled, which is how the run proves the guider actually used it."""
 
-    def __init__(self, planner, inner=None, log=None, check_interrupt=None):
+    def __init__(self, planner, inner=None, log=None, check_interrupt=None, hub=None):
         self.planner = planner
         self.inner = inner
         self.log = log
         self.check_interrupt = check_interrupt
         self.calls = 0
+        # preview_mode (preview.py): the hub sees every window's cond answer, and `emit` sends what
+        # it renders. Both None by default.
+        self.hub = hub
+        self.emit = None
 
     def __call__(self, apply_model, args):
         x, timestep, c = args["input"], args["timestep"], args["c"]
@@ -266,6 +270,8 @@ class TiledModelWrapper:
                                                   "cond_or_uncond": args.get("cond_or_uncond")})
             else:
                 result = apply_model(tile_x, timestep, **tile_c)
+            if self.hub is not None:
+                self._preview(win, tile_x, result, args.get("cond_or_uncond"), windows)
             if out is None:
                 out = result.new_zeros((*result.shape[:-2], height, width))
                 if any(w.weight is not None for v in windows for w in v.writes):
@@ -283,6 +289,20 @@ class TiledModelWrapper:
         if wsum is not None:
             out = out / wsum
         return out
+
+    def _preview(self, win, tile_x, result, cond_or_uncond, windows):
+        # The cond chunk of this window (the batch is the cond/uncond chunks concatenated); a call
+        # with no cond chunk only records the windows, for the grid.
+        chunks = list(cond_or_uncond or [0])
+        if 0 not in chunks:
+            self.hub.window(win, None, None, windows)
+            return
+        i = chunks.index(0)
+        x_win = tile_x.chunk(len(chunks))[i]
+        out_win = result.chunk(len(chunks))[i]
+        shown = self.hub.window(win, x_win, out_win, windows)
+        if shown is not None and self.emit is not None:
+            self.emit(shown)
 
 
 def _slice_spatial(value, height, width, ys, xs):
@@ -346,7 +366,7 @@ def fixed_layout(canvas_w, canvas_h, max_tile_width, max_tile_height, context_an
 
 def refine_all_at_once(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor,
                        context_overlap, geometry, tile_mode=SHIFTING, tile_size=SIZE_FULL, batch_size=1, batch_index=0,
-                       log=None):
+                       log=None, preview_mode=None):
     """One picture through an all at once mode: encode the whole canvas (core's VAE call, which
     tiles itself when its estimate or an OOM says so), sample it as one run with the tiling
     wrapper, decode the whole canvas, crop back. For the shifting grid context_anchor is the ring
@@ -390,8 +410,14 @@ def refine_all_at_once(image, guider, sampler, sigmas, vae, noise, max_tile_widt
     latent = sampling.encode_pixels(vae, padded)
     canvas_noise = sampling.build_canvas_noise(vae, noise, canvas_h, canvas_w, batch, batch_size, batch_index,
                                                latent_scale=geometry.scale)
+    from . import preview
+
+    hub = preview.make_hub(preview_mode, guider.model_patcher, (cells_h, cells_w), scale=geometry.scale)
+    if hub is not None:
+        hub.begin_canvas(latent)
     wrapper = TiledModelWrapper(planner, log=log,
-                                check_interrupt=comfy.model_management.throw_exception_if_processing_interrupted)
+                                check_interrupt=comfy.model_management.throw_exception_if_processing_interrupted,
+                                hub=hub)
     run_guider = wrapped_guider(guider, wrapper)
     with tile_memory_estimate(guider, cap_h, cap_w):
         samples = sampling.sample_latent(run_guider, sampler, sigmas, canvas_noise, seed, latent,
@@ -416,13 +442,30 @@ def _require_wrapper_used(wrapper):
 def _guarded_callback(guider, sigmas, wrapper):
     # The sampler's per-step callback (core's latent preview) with the wrapper check after the first
     # step, so a guider that bypasses the wrapper stops after one step instead of at the end.
+    # With a preview_mode hub on the wrapper the callback keeps its own progress bar, so the
+    # wrapper's per-window previews (one tile at a time) land on the step the run is at.
     import latent_preview
 
-    preview = latent_preview.prepare_callback(guider.model_patcher, sigmas.shape[-1] - 1)
+    steps = sigmas.shape[-1] - 1
+    if wrapper.hub is None:
+        core_preview = latent_preview.prepare_callback(guider.model_patcher, steps)
+
+        def callback(step, x0, x, total_steps):
+            _require_wrapper_used(wrapper)
+            core_preview(step, x0, x, total_steps)
+
+        return callback
+
+    import comfy.utils
+
+    pbar = comfy.utils.ProgressBar(steps)
+    at = {"step": 0}
+    wrapper.emit = lambda shown: pbar.update_absolute(at["step"], steps, shown)
 
     def callback(step, x0, x, total_steps):
         _require_wrapper_used(wrapper)
-        preview(step, x0, x, total_steps)
+        at["step"] = step + 1
+        pbar.update_absolute(step + 1, total_steps, wrapper.hub.canvas_step(x0, x))
 
     return callback
 
