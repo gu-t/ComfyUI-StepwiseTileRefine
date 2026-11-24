@@ -12,7 +12,7 @@ and is thrown away.
 Two grids:
 
     all at once            the planner's fixed grid, the same tiles as tile by tile. A tile writes
-                           its core plus the context_overlap band on every neighbour side, and in
+                           its core plus the tile_overlap band on every neighbour side, and in
                            the bands the neighbours' answers are weighted together smoothly at
                            every call, so the two sides of a seam share one band every step.
     all at once, shifting  a grid of max_tile minus the ring on both sides, shifted by a random
@@ -53,8 +53,8 @@ TILE_MODE_TOOLTIP = (
     "neighbours' answers are weighted together at every step, and the ring sits at the same noise level and is "
     "only context. Nothing is frozen. "
     "all at once, shifting: all tiles take every step together on a grid that is shifted randomly before every "
-    "step, so the seams move. The core is max_tile minus context_anchor on both sides, cores meet edge to edge "
-    "and context_overlap is unused.")
+    "step, so the seams move. The core is max_tile minus tile_padding on both sides, cores meet edge to edge "
+    "and tile_overlap is unused.")
 TILE_SIZE_TOOLTIP = (
     "always full: every window the model sees is grown to exactly max_tile (inward at the image edge). In tile "
     "by tile and all at once the ring grows and the core and band stay the same. In all at once, shifting a "
@@ -84,7 +84,7 @@ def tile_cells(max_tile_width, max_tile_height, ring_px, geometry):
         if core_px < geometry.multiple:
             raise ValueError(
                 f"All at once, shifting: {name} {cap} leaves no core inside a {ring_px} px ring on both sides. "
-                f"Raise {name} or lower context_anchor.")
+                f"Raise {name} or lower tile_padding.")
         cores.append(core_px // geometry.scale)
     return cores[0], cores[1], ring_px // geometry.scale
 
@@ -450,26 +450,25 @@ def format_plan(plan, tile_mode, tile_size, context_anchor):
     if tile_mode == TILE_BY_TILE:
         if tile_size != SIZE_FULL:
             return ""
-        return ("### Tile mode: tile by tile, always full\n\n"
-                f"- Every tile's frozen ring grows until the model sees {plan.cap_width}x{plan.cap_height} px (inward at "
-                "the image edge), so the Sampled column above is the bare minimum. Core and band are unchanged.")
+        return ("TILE MODE: tile by tile, always full\n"
+                f"  Every tile's frozen ring grows until the model sees {plan.cap_width}x{plan.cap_height} px (inward at "
+                "the image edge), so \"model sees\" above is the bare minimum. Core and band are unchanged.")
     if tile_mode == ALL_AT_ONCE:
-        lines = ["### Tile mode: all at once", "",
-                 f"- The grid in the table, all tiles stepped together. Bands of {plan.context_overlap} px are weighted "
-                 f"together at every step, and the {plan.context_anchor} px ring is live context at the same noise level."]
+        lines = ["TILE MODE: all at once",
+                 f"  The tiles above, all stepped together. Bands of {plan.context_overlap} px are weighted together "
+                 f"at every step, and the {plan.context_anchor} px ring is live context at the same noise level."]
         if tile_size == SIZE_FULL:
-            lines.append(f"- always full: every window grows to {plan.cap_width}x{plan.cap_height} px "
+            lines.append(f"  always full: every window grows to {plan.cap_width}x{plan.cap_height} px "
                          "(identical windows run once).")
         return "\n".join(lines)
     core_h, core_w, ring = tile_cells(plan.cap_width, plan.cap_height, context_anchor, g)
     lines = [
-        "### Tile mode: all at once, shifting",
-        "",
-        f"- Core {core_w * g.scale}x{core_h * g.scale} px, ring {ring * g.scale} px, tile size {tile_size}, a new grid "
-        "offset at every sampler step. The Tiles / Core / Sampled columns above are the fixed grid and do not apply.",
+        "TILE MODE: all at once, shifting",
+        f"  Core {core_w * g.scale}x{core_h * g.scale} px, ring {ring * g.scale} px, tile size {tile_size}, a new grid "
+        "offset at every sampler step. The tiles listed above are the fixed grid and do not apply.",
     ]
     for s in plan.steps:
         low, high = windows_per_call(s.width, s.height, core_h, core_w, ring, g, tile_size)
         span = f"{low}" if low == high else f"{low} to {high}"
-        lines.append(f"- Step {s.index} ({s.width}x{s.height}): {span} windows per model call")
+        lines.append(f"  Step {s.index} ({s.width}x{s.height}): {span} windows per model call")
     return "\n".join(lines)

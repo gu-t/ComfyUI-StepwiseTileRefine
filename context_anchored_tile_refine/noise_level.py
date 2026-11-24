@@ -117,21 +117,15 @@ def build_schedule(model_patcher, scheduler, steps, value, mode=NOISE_LEVEL):
 
 
 def format_schedules(schedules, scheduler, steps):
-    """Markdown table: what each step's setting became in start noise and BasicScheduler terms."""
-    lines = [
-        "",
-        f"### Noise per step ({scheduler}, {steps} sampler steps)",
-        "",
-        "| Step | Setting | Start noise level | Start sigma | Same as denoise | Schedule |",
-        "|---|---|---|---|---|---|",
-    ]
+    """Plain text: what each step's setting became in start noise and BasicScheduler terms."""
+    lines = ["", f"NOISE PER STEP ({scheduler}, {steps} sampler steps)"]
     for i, s in enumerate(schedules, 1):
         if s.total == 0:
-            lines.append(f"| {i} | {s.mode} {s.value:.3f} | 0 | - | 0 | no sampling |")
+            lines.append(f"  Step {i}: {s.mode} {s.value:.3f}, no sampling")
             continue
         lines.append(
-            f"| {i} | {s.mode} {s.value:.3f} | {s.start_level:.3f} | {s.start_sigma:.4g} | {s.denoise:.4f} "
-            f"| last {steps + 1} of {s.total + 1} sigmas |")
+            f"  Step {i}: {s.mode} {s.value:.3f} -> starts at noise level {s.start_level:.3f} (sigma "
+            f"{s.start_sigma:.4g}, same as denoise {s.denoise:.4f}), the last {steps + 1} of {s.total + 1} sigmas")
     return "\n".join(lines)
 
 

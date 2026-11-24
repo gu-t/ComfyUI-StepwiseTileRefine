@@ -97,7 +97,7 @@ def test_format_schedules_lists_every_step(comfy_stubs, monkeypatch):
     monkeypatch.setattr(sys.modules["comfy.samplers"], "calculate_sigmas", lambda ms, name, n: flow_simple(n))
     rows = [build_schedule(_patcher(True), "simple", 25, v, NOISE_LEVEL) for v in (0.35, 0.0)]
     text = noise_level.format_schedules(rows, "simple", 25)
-    assert "| 1 | noise level 0.350 | 0.349 |" in text
+    assert "Step 1: noise level 0.350 -> starts at noise level 0.349" in text
     assert "no sampling" in text
 
 

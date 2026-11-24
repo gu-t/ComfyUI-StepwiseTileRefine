@@ -420,9 +420,9 @@ def test_all_at_once_modes_reject_a_mask(comfy_stubs, tile_mode):
                                   mask=torch.ones(1, 64, 64), tile_mode=tile_mode)
 
 
-@pytest.mark.parametrize("tile_mode, heading", [(ALL_AT_ONCE, "Tile mode: all at once"),
+@pytest.mark.parametrize("tile_mode, heading", [(ALL_AT_ONCE, "TILE MODE: all at once"),
                                                 (SHIFTING, "windows per model call"),
-                                                (TILE_BY_TILE, "Tile mode: tile by tile, always full")])
+                                                (TILE_BY_TILE, "TILE MODE: tile by tile, always full")])
 def test_stepwise_node_tile_modes_end_to_end(comfy_stubs, tile_mode, heading):
     image = _smooth_image(120, 160)
     guider = WrapperGuider() if tile_mode != TILE_BY_TILE else _stepwise_guider()
@@ -438,12 +438,45 @@ def test_stepwise_node_tile_modes_end_to_end(comfy_stubs, tile_mode, heading):
         assert [c["seed"] for c in guider.calls] == [ZeroNoise.seed, ZeroNoise.seed + 1, ZeroNoise.seed + 2]
 
 
-def test_the_new_widgets_are_appended_last_on_both_nodes(comfy_stubs):
-    for node in (TileRefineAnyVAE, StepwiseTileUpscale):
-        types = node.INPUT_TYPES()
-        names = list(itertools.chain(types["required"], types.get("optional", {})))
-        assert names[-2:] == ["tile_mode", "tile_size"], node
-        assert types["optional"]["tile_mode"][0] == [TILE_BY_TILE, ALL_AT_ONCE, SHIFTING]
-        assert types["optional"]["tile_mode"][1]["default"] == TILE_BY_TILE
-        assert types["optional"]["tile_size"][0] == [SIZE_FULL, SIZE_SMALLER]
-        assert types["optional"]["tile_size"][1]["default"] == SIZE_FULL
+STEPWISE_ORDER = [
+    "image", "guider", "sampler", "noise", "vae",
+    "upscale_by", "upscale_steps", "auto_step_factor", "oversample", "oversample_mode", "upscale_method",
+    "downscale_method",
+    "denoise_mode", "denoise_first", "denoise_last", "scheduler", "steps",
+    "tile_mode", "tile_size", "max_tile_width", "max_tile_height", "tile_overlap", "tile_padding",
+    "plan_only",
+    "upscale_model", "aspect_tolerance", "latent_scale", "pixel_multiple",
+]
+ANY_VAE_ORDER = [
+    "image", "guider", "sampler", "sigmas", "noise", "vae",
+    "tile_mode", "tile_size", "max_tile_width", "max_tile_height", "tile_overlap", "tile_padding",
+    "mask", "latent_scale", "pixel_multiple",
+]
+
+
+@pytest.mark.parametrize("node, order", [(StepwiseTileUpscale, STEPWISE_ORDER), (TileRefineAnyVAE, ANY_VAE_ORDER)])
+def test_the_widget_order_is_pinned(comfy_stubs, node, order):
+    # The frontend restores widgets_values by position, so this order is what every saved workflow
+    # (and workflows/) depends on. Append new widgets last.
+    types = node.INPUT_TYPES()
+    assert list(itertools.chain(types["required"], types.get("optional", {}))) == order
+    assert types["required"]["tile_mode"][0] == [TILE_BY_TILE, ALL_AT_ONCE, SHIFTING]
+    assert types["required"]["tile_mode"][1]["default"] == TILE_BY_TILE
+    assert types["required"]["tile_size"][0] == [SIZE_FULL, SIZE_SMALLER]
+    assert types["required"]["tile_size"][1]["default"] == SIZE_FULL
+
+
+def test_the_example_workflow_matches_the_widget_order(comfy_stubs):
+    import json
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parent.parent / "workflows" / "MOSS-Image stepwise upscale.json"
+    workflow = json.loads(path.read_text(encoding="utf-8"))
+    node = next(n for n in workflow["nodes"] if n["type"] == "StepwiseTileUpscale")
+    types = StepwiseTileUpscale.INPUT_TYPES()
+    specs = {**types["required"], **types.get("optional", {})}
+    widgets = [name for name in STEPWISE_ORDER if not isinstance(specs[name][0], str) or specs[name][0] in
+               ("INT", "FLOAT", "BOOLEAN", "STRING")]
+    assert len(node["widgets_values"]) == len(widgets)
+    values = dict(zip(widgets, node["widgets_values"], strict=True))
+    assert values["tile_mode"] == TILE_BY_TILE and values["scheduler"] == "simple" and values["tile_padding"] == 32

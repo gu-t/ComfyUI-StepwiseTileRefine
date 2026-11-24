@@ -200,7 +200,8 @@ def test_plan_text_lists_every_step():
     plan = stepwise_plan.plan_upscale(1280, 976, 3.0, 3, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.45, 0.22, 0.01)
     text = stepwise_plan.format_plan(plan, 25)
     assert "1280x976 -> target 3840x2928" in text
-    assert text.count("\n| ") == 1 + len(plan.steps)
+    assert sum(line.startswith("Step ") for line in text.splitlines()) == len(plan.steps)
+    assert "|" not in text and "#" not in text
     assert "Latent cell 16 px" in text
 
 
@@ -282,11 +283,17 @@ def test_any_vae_node_refine_method_matches_upstream_node(comfy_stubs):
     assert torch.equal(up[0], fork[0])
 
 
-def test_any_vae_node_inputs_extend_upstream():
+def test_any_vae_node_inputs_rename_upstreams_rings():
+    # The fork's widget names: tile_padding is upstream's context_anchor, tile_overlap its
+    # context_overlap. The sockets and the tile cap keep upstream's specs.
     upstream = ContextAnchoredTileRefine.INPUT_TYPES()
     fork = TileRefineAnyVAE.INPUT_TYPES()
-    assert list(fork["required"]) == list(upstream["required"])
+    renamed = {"context_anchor": "tile_padding", "context_overlap": "tile_overlap"}
+    assert {renamed.get(n, n) for n in upstream["required"]} <= set(fork["required"])
+    for name in ("image", "guider", "sampler", "sigmas", "vae", "noise", "max_tile_width", "max_tile_height"):
+        assert fork["required"][name] == upstream["required"][name]
     assert {"mask", "latent_scale", "pixel_multiple"} <= set(fork["optional"])
+    assert TileRefineAnyVAE.VALIDATE_INPUTS(tile_padding=12) == "tile_padding must be a multiple of 8, got 12"
 
 
 # --- the stepwise node end to end -------------------------------------------------------------
@@ -313,7 +320,7 @@ def test_stepwise_node_end_to_end(comfy_stubs, scale, channels, multiple, src, f
     assert step_images[-1] is final
     if steps:
         assert len(step_images) == steps
-    assert "Stepwise Tile Upscale plan" in text
+    assert "STEPWISE TILE UPSCALE PLAN" in text
     for cw, ch in vae.encode_shapes:
         assert cw % (multiple or scale) == 0 and ch % (multiple or scale) == 0 and cw <= 256 and ch <= 256
 
@@ -401,7 +408,7 @@ def test_plan_oversampled_upscale(mode):
     assert all(s.method == "bicubic (catmull-rom)" for s in plan.steps)
     assert plan.final == stepwise_plan.FinalResample(2600, 1950, 2000, 1500, "area")
     text = stepwise_plan.format_plan(plan, 12)
-    assert f"oversample x1.3 {mode}" in text and "| final |" in text and "2600x1950" in text
+    assert f"oversample x1.3 {mode}" in text and "Final: " in text and "2600x1950" in text
 
 
 def test_plan_constant_oversample_is_the_enlarge_refine_shrink_loop():
@@ -415,7 +422,7 @@ def test_plan_constant_oversample_is_the_enlarge_refine_shrink_loop():
 def test_plan_plain_upscale_has_no_final_resample():
     plan = stepwise_plan.plan_upscale(1280, 960, 3.0, 3, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.45, 0.22, 0.01)
     assert plan.final is None and plan.oversample == 1.0
-    assert "| final |" not in stepwise_plan.format_plan(plan)
+    assert "Final: " not in stepwise_plan.format_plan(plan)
     ramp = stepwise_plan.plan_upscale(1280, 960, 3.0, 3, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.45, 0.22,
                                       0.01, oversample_mode="ramp up")
     assert ramp.steps == plan.steps
@@ -523,6 +530,6 @@ def test_stepwise_node_repair_loop_end_to_end(comfy_stubs, upscale_by, oversampl
         downscale_method="bicubic (catmull-rom)")
     assert (final.shape[2], final.shape[1]) == (round(160 * upscale_by), round(120 * upscale_by))
     assert len(step_images) == 4 and step_images[-1] is final
-    assert "| final |" in text
+    assert "Final: " in text
     # Each pass draws its noise on its own seed.
     assert sorted(set(log)) == [3, 4, 5]

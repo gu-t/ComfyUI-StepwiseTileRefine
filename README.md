@@ -42,38 +42,56 @@ Upscales in several steps. Each step enlarges the whole image in pixel space and
 | Input | What it does |
 |---|---|
 | `image`, `guider`, `sampler`, `noise`, `vae` | As for `SamplerCustomAdvanced`. The VAE's latent scale is read automatically. |
-| `scheduler`, `steps` | How each step's noise levels are spaced, and how many sampler steps each tile gets. See [Noise level or denoise](#noise-level-or-denoise). |
 | `upscale_by` | Output size: the final image is exactly `round(input × upscale_by)` on each axis. `1` keeps the input size. |
+| `upscale_steps` | Number of refine passes. `0` picks the fewest whose growth per pass stays at or under `auto_step_factor`. |
+| `auto_step_factor` | Largest growth per pass when `upscale_steps` is `0` (default 1.5, so 2 steps for x2 and 3 for x3). Unused when `upscale_steps` is set. |
 | `oversample` | Runs the refine passes this much larger than the output track and shrinks onto the exact output size after the last pass. The largest pass is `input × upscale_by × oversample`. `1` is off. See [The repair loop](#the-repair-loop). |
 | `oversample_mode` | `constant`: the first pass jumps to the oversample and every pass keeps it. `ramp up`: the passes grow evenly and reach it on the last pass. |
-| `upscale_steps` | Number of refine passes. `0` picks the fewest whose growth per pass stays at or under `auto_step_factor` (1.5), e.g. 2 steps for x2 and 3 for x3. |
 | `upscale_method` / `downscale_method` | The filters for enlarging and for the shrink after the last pass, soft to sharp: `bilinear` (enlarge only), `area` (shrink only), `bicubic (B-spline)`, `bicubic (mitchell)`, `bicubic (catmull-rom)`, `lanczos`. Defaults `lanczos` and `area`. |
-| `max_tile_width` / `max_tile_height` | Largest size the model sees per tile, rings included. `0` picks 1024 for SDXL/Flux/MOSS-class models and 768 for SD1.x/2.x. |
-| `context_anchor` / `context_overlap` | Minimum ring widths (frozen context, and the band shared and blended between neighbours). They are rounded up to whole latent cells and the pixel grid. |
+| `denoise_mode` | `noise level` (default): `denoise_first` / `denoise_last` are the share of noise each step starts from, the same for every scheduler. `denoise`: they are `BasicScheduler` denoise values. The plan shows both for every step. |
 | `denoise_first` / `denoise_last` | Strength of the first and the last step, three decimals. The steps in between are interpolated linearly per step. Since every step enlarges by about the same factor, that is the same drop per factor of size. |
-| `denoise_mode` | `noise level` (default): the two values are the share of noise each step starts from, the same for every scheduler. `denoise`: they are `BasicScheduler` denoise values. The plan shows both for every step. |
+| `scheduler`, `steps` | How each step's noise levels are spaced, and how many sampler steps each tile gets. See [Noise level or denoise](#noise-level-or-denoise). |
+| `tile_mode` | How the tiles are run: `tile by tile` (default), `all at once` or `all at once, shifting`. See [Tile modes](#tile-modes). |
+| `tile_size` | `always full` (default): every window the model sees is grown to exactly `max_tile`. `allow smaller`: windows keep their bare size, so edge tiles can be smaller. |
+| `max_tile_width` / `max_tile_height` | Largest size the model sees per tile, overlap and padding included. `0` picks 1024 for SDXL/Flux/MOSS-class models and 768 for SD1.x/2.x. |
+| `tile_overlap` | The band where neighbouring tiles overlap and are blended, outward from each core. Rounded up to whole latent cells. Unused in `all at once, shifting`. |
+| `tile_padding` | Context outside the overlap band that the model sees and that is thrown away afterwards: frozen in `tile by tile`, live in the `all at once` modes. Rounded up to whole latent cells and the pixel grid. |
 | `plan_only` | Computes and outputs the plan without sampling, so you can check it before a long run. |
 | `upscale_model` (optional) | Used for the first step only, then `upscale_method` to that step's exact size. Later steps use `upscale_method` only, so a 4x model never runs on a large intermediate. |
 | `aspect_tolerance` (advanced) | How much aspect-ratio deviation (percent) an intermediate step may take to get tiles of equal size. `0` keeps the closest exact enlargement. The final step is always exact. |
-| `auto_step_factor`, `latent_scale`, `pixel_multiple` (advanced) | See [How the steps are planned](#how-the-steps-are-planned) and [Other models](#other-models). |
-| `tile_mode` | How the tiles are run: `tile by tile` (default), `all at once` or `all at once, shifting`. See [Tile modes](#tile-modes). |
-| `tile_size` | `always full` (default): every window the model sees is grown to exactly `max_tile`. `allow smaller`: windows keep their bare size, so edge tiles can be smaller. |
+| `latent_scale`, `pixel_multiple` (advanced) | See [Other models](#other-models). |
 
-Outputs: the final `image`, `step_images` (the result of every step, as a list since the sizes differ) and `plan`, a Markdown table that is also written to the log. Connect `plan` to *Preview as Text* in Markdown mode.
+Outputs: the final `image`, `step_images` (the result of every step, as a list since the sizes differ) and `plan`, plain text that is also written to the log when the run starts. Connect `plan` to *Preview as Text*. Node outputs reach other nodes only when the whole node is done, so set `plan_only` to see the plan before a long run.
 
 Example plan, MOSS-Image, 1280x960 x3, auto steps, noise level 0.35 -> 0.25:
 
-| Step | Size | Factor x / y | Aspect dev | Tiles | Core px (w x h) | Sampled px (w x h) | Noise level | Enlarge | Size choice |
-|---|---|---|---|---|---|---|---|---|---|
-| 1 | 1280x960 -> 1824x1376 | 1.425 / 1.433 | -0.58% | 2x2 = 4 | 912 x 688 | 976 x 752 | 0.350 | lanczos | even tiles |
-| 2 | 1824x1376 -> 2688x2016 | 1.474 / 1.465 | +0.00% | 3x3 = 9 | 896 x 672 | 1024/960 x 800/736 | 0.300 | lanczos | even tiles |
-| 3 | 2688x2016 -> 3840x2880 | 1.429 / 1.429 | +0.00% | 5x4 = 20 | 768 x 720 | 896/832 x 848/784 | 0.250 | lanczos | final (exact) |
+```text
+STEPWISE TILE UPSCALE PLAN
+Source 1280x960 -> target 3840x2880 (x3), 3 steps.
+Latent cell 16 px, pixel grid 16 px, max tile 1024x1024 px (what the model sees, rings included).
+Rings: tile_overlap 32 px, tile_padding 32 px. Aspect tolerance 1%.
 
-| Step | Setting | Start noise level | Start sigma | Same as denoise | Schedule |
-|---|---|---|---|---|---|
-| 1 | noise level 0.350 | 0.349 | 0.3494 | 0.0969 | last 26 of 259 sigmas |
-| 2 | noise level 0.300 | 0.300 | 0.3002 | 0.0781 | last 26 of 321 sigmas |
-| 3 | noise level 0.250 | 0.252 | 0.2516 | 0.0620 | last 26 of 404 sigmas |
+Step 1: 1280x960 -> 1824x1376, x1.425 / x1.433, aspect -0.58%, lanczos, size: even tiles
+  Tiles 2x2 = 4, core 912 x 688 px, model sees 976 x 752 px
+  Noise level 0.350
+
+Step 2: 1824x1376 -> 2688x2016, x1.474 / x1.465, aspect +0.00%, lanczos, size: even tiles
+  Tiles 3x3 = 9, core 896 x 672 px, model sees 1024/960 x 800/736 px
+  Noise level 0.300
+
+Step 3: 2688x2016 -> 3840x2880, x1.429 / x1.429, aspect +0.00%, lanczos, size: final (exact)
+  Tiles 5x4 = 20, core 768 x 720 px, model sees 896/832 x 848/784 px
+  Noise level 0.250
+
+Total 33 tiles x 25 sampler steps.
+
+NOISE PER STEP (simple, 25 sampler steps)
+  Step 1: noise level 0.350 -> starts at noise level 0.349 (sigma 0.3494, same as denoise 0.0969), the last 26 of 259 sigmas
+  Step 2: noise level 0.300 -> starts at noise level 0.300 (sigma 0.3002, same as denoise 0.0781), the last 26 of 321 sigmas
+  Step 3: noise level 0.250 -> starts at noise level 0.252 (sigma 0.2516, same as denoise 0.0620), the last 26 of 404 sigmas
+```
+
+With `tile_size` `always full` (the default) the plan adds a TILE MODE section, since every tile then sees the whole `max_tile`.
 
 ### Noise Level Scheduler
 
@@ -81,7 +99,7 @@ Example plan, MOSS-Image, 1280x960 x3, auto steps, noise level 0.35 -> 0.25:
 
 ### Tile Refine (Any VAE)
 
-Upstream's base node (*Context-Anchored Tile Refine*) with the latent scale read from the VAE instead of assumed to be 8. Upscale the image first and feed it in; denoise is set through the sigmas (`BasicScheduler`'s `denoise`). An optional `mask` refines only the masked region (tile by tile only). It has the same `tile_mode` and `tile_size` widgets as the Stepwise node. With `tile by tile` and `tile_size` `allow smaller` on an 8x VAE it gives byte-identical output to the upstream node.
+Upstream's base node (*Context-Anchored Tile Refine*) with the latent scale read from the VAE instead of assumed to be 8. Upscale the image first and feed it in; denoise is set through the sigmas (`BasicScheduler`'s `denoise`). An optional `mask` refines only the masked region (tile by tile only). It has the same `tile_mode`, `tile_size`, `tile_overlap` and `tile_padding` widgets as the Stepwise node (upstream calls the last two `context_overlap` and `context_anchor`). With `tile by tile` and `tile_size` `allow smaller` on an 8x VAE it gives byte-identical output to the upstream node.
 
 ## Tile modes
 
@@ -91,7 +109,7 @@ Upstream's base node (*Context-Anchored Tile Refine*) with the latent scale read
 |---|---|---|
 | `tile by tile` | The tiles run one after another in raster order. Each tile is denoised to the end with the full schedule before the next starts. Its ring is frozen: finished neighbours show their finished pixels, the rest show the source. The overlap band is cross-faded into the finished neighbour afterwards. | Hidden by the tile continuing its finished neighbours. |
 | `all at once` | The same tiles as tile by tile, but all of them take every sampler step together. In the overlap bands both neighbours' answers are weighted together at every step. The ring sits at the same noise level as the rest of the image and is only context. Nothing is frozen. | The seams stay in place, but both sides share one band at every step. |
-| `all at once, shifting` | All tiles take every step together on a grid that is shifted by a random x/y offset (drawn from the seed) before every step. The core is `max_tile` minus `context_anchor` on both sides, cores meet edge to edge and `context_overlap` is unused. | The seams move every step, so none builds up. |
+| `all at once, shifting` | All tiles take every step together on a grid that is shifted by a random x/y offset (drawn from the seed) before every step. The core is `max_tile` minus `tile_padding` on both sides, cores meet edge to edge and `tile_overlap` is unused. | The seams move every step, so none builds up. |
 
 The two `all at once` modes put the tiling inside the model call: the sampler runs one ordinary pass over the whole image, and every model evaluation is split into tile windows and put back together. So every sampler works, including ones with history and per-step (ancestral / SDE) noise, and that noise is drawn for the whole image. Windows that come out identical run once. Measured on MOSS-Image at 8 MP with a single-subject prompt at noise level 0.95: `tile by tile` showed clear seams, `all at once` at most faint ones, and `all at once, shifting` none, at about 1.8x the time of the other two.
 
@@ -146,7 +164,7 @@ What the tests in this repository used, and a good starting point:
 
 - Diffusion model: `moss_image_sft_int8_convrot` (Load Diffusion Model), text encoder `qwen3.5_9b_w4a8_gptq` (Load CLIP, type `moss_image`), VAE `flux2-vae`.
 - `CFGGuider` cfg 3, sampler `er_sde`, scheduler `simple`, 25 steps. Shift 5 is set by the model automatically.
-- Max tile `0` (auto = 1024, about 1 MP per tile, within MOSS's 1-2 MP sweet spot), `context_anchor` 32, `context_overlap` 32.
+- Max tile `0` (auto = 1024, about 1 MP per tile, within MOSS's 1-2 MP sweet spot), `tile_overlap` 32, `tile_padding` 32.
 - Noise level 0.35 -> 0.25 (the default). A ground-truth sweep (a MOSS image downscaled, upscaled back in one step and compared with the original) found about 0.21-0.27 per x1.5 step and 0.36-0.40 per x2 step the most that sharpens without changing content. From about 0.47 (denoise 0.15) MOSS starts inventing things (an object in a dark window, redrawn wires), and from about 0.68 (denoise 0.3) skin turns waxy and texture painterly. The tests below ran at the older default, denoise 0.45 -> 0.22 (start noise 0.81 -> 0.59).
 - The positive prompt reaches every tile. Objects it names (say "seagulls") get drawn into any tile with a vaguely matching shape, more so at higher denoise. For upscaling, prefer a prompt that describes the style, medium and lighting rather than the objects, or lower the denoise (0.35 -> 0.18 cut the colour drift of the 3-step test by a fifth).
 - Do not start ComfyUI with `--use-sage-attention`: it produces broken images with MOSS-Image.
@@ -180,7 +198,7 @@ Nothing model-specific is hard-coded. Everything that depends on the model or th
 | Latent scale (pixels per latent cell) | read from the VAE (`vae.spacial_compression_encode()`): 8 for SD/SDXL/Flux.1/Z-Image, 16 for FLUX.2/MOSS-Image | `latent_scale` |
 | Pixel grid for canvas, tiles and rings | the latent scale | `pixel_multiple`, e.g. 32 for a 16x VAE with a DiT patch size of 2 (MiniMax H3), or 16 for Flux.1 if you want patch-exact tiles |
 | Tile cap | 1024, or 768 for SD1.x/2.x | `max_tile_width` / `max_tile_height` |
-| Ring widths | your minimums, rounded up to whole latent cells and the grid | `context_anchor` / `context_overlap` |
+| Ring widths | your minimums, rounded up to whole latent cells and the grid | `tile_overlap` / `tile_padding` |
 
 ## What the fork changes
 

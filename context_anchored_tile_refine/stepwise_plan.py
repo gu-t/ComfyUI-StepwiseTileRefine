@@ -253,7 +253,7 @@ def plan_upscale(src_width, src_height, factor, steps, geometry, cap_width, cap_
     growth = (factor * oversample if ramp else factor) ** (1.0 / n_steps)
     notes = []
     if (anchor, overlap) != (context_anchor, context_overlap):
-        notes.append(f"rings rounded up to anchor {anchor} / overlap {overlap} px for the {geometry.multiple} px grid")
+        notes.append(f"rings rounded up to tile_overlap {overlap} / tile_padding {anchor} px for the {geometry.multiple} px grid")
     if n_steps > 1 and factor <= 1.0:
         notes.append("factor <= 1: every step after the first refines at the same size")
     if n_steps > 1 and not plain and abs(growth - 1.0) < 1e-9:
@@ -326,56 +326,56 @@ def _fmt_sampled(gx, gy):
 
 
 def format_plan(plan, sampler_steps=None, value_label="Denoise"):
-    """The plan as Markdown: a header, one table row per step, then warnings and notes."""
+    """The plan as plain text (it is read in a text preview and the log, where Markdown shows raw): a
+    header, one block per step, then warnings and notes."""
     g = plan.geometry
     n = len(plan.steps)
     scale_text = f"x{plan.factor:g}"
     if plan.oversample != 1.0:
         scale_text += f", oversample x{plan.oversample:g} {plan.oversample_mode}"
     lines = [
-        "## Stepwise Tile Upscale plan",
-        "",
-        f"- Source {plan.src_width}x{plan.src_height} -> target {plan.width}x{plan.height} "
-        f"({scale_text}), {n} step{'s' if n != 1 else ''}",
-        f"- Latent cell {g.scale} px, pixel grid {g.multiple} px, max tile {plan.cap_width}x{plan.cap_height} px "
-        f"(sampled crop incl. rings)",
-        f"- Rings: context_anchor {plan.context_anchor} px, context_overlap {plan.context_overlap} px; "
-        f"aspect tolerance {plan.aspect_tolerance * 100:g}%",
+        "STEPWISE TILE UPSCALE PLAN",
+        f"Source {plan.src_width}x{plan.src_height} -> target {plan.width}x{plan.height} "
+        f"({scale_text}), {n} step{'s' if n != 1 else ''}.",
+        f"Latent cell {g.scale} px, pixel grid {g.multiple} px, max tile {plan.cap_width}x{plan.cap_height} px "
+        f"(what the model sees, rings included).",
+        f"Rings: tile_overlap {plan.context_overlap} px, tile_padding {plan.context_anchor} px. "
+        f"Aspect tolerance {plan.aspect_tolerance * 100:g}%.",
     ]
     if plan.oversample != 1.0:
         over, last = plan.oversample, plan.steps[-1]
         if plan.oversample_mode == OVERSAMPLE_RAMP:
             grow = (plan.factor * over) ** (1.0 / n)
-            lines.append(f"- The passes grow by x{grow:.4f} each to x{plan.factor * over:.4g} ({last.width}x{last.height}), "
-                         f"then one shrink /{over:g} onto the target")
+            lines.append(f"The passes grow by x{grow:.4f} each to x{plan.factor * over:.4g} ({last.width}x{last.height}), "
+                         f"then one shrink /{over:g} onto the target.")
         else:
             grow = plan.factor ** (1.0 / n)
-            lines.append(f"- Each pass: enlarge x{grow * over:.4f}, refine, shrink /{over:g} (between passes merged "
-                         f"into one resample x{grow:.4f}); largest pass {last.width}x{last.height}")
-    lines += [
-        "",
-        f"| Step | Size | Factor x / y | Aspect dev | Tiles | Core px (w x h) | Sampled px (w x h) | {value_label} | Enlarge | Size choice |",
-        "|---|---|---|---|---|---|---|---|---|---|",
-    ]
+            lines.append(f"Each pass: enlarge x{grow * over:.4f}, refine, shrink /{over:g} (between passes merged "
+                         f"into one resample x{grow:.4f}). Largest pass {last.width}x{last.height}.")
     for s in plan.steps:
         aspect = plan.aspect_deviation(s.width, s.height) * 100
-        lines.append(
-            f"| {s.index} | {s.src_width}x{s.src_height} -> {s.width}x{s.height} | {s.factor_x:.3f} / {s.factor_y:.3f} "
-            f"| {aspect:+.2f}% | {s.grid_x.n}x{s.grid_y.n} = {s.tiles} | {_fmt_axis_sizes(s.grid_x, s.grid_y)} "
-            f"| {_fmt_sampled(s.grid_x, s.grid_y)} | {s.denoise:.3f} | {s.upscale} | {s.size_choice} |")
+        lines += [
+            "",
+            f"Step {s.index}: {s.src_width}x{s.src_height} -> {s.width}x{s.height}, x{s.factor_x:.3f} / x{s.factor_y:.3f}, "
+            f"aspect {aspect:+.2f}%, {s.upscale}, size: {s.size_choice}",
+            f"  Tiles {s.grid_x.n}x{s.grid_y.n} = {s.tiles}, core {_fmt_axis_sizes(s.grid_x, s.grid_y)} px, "
+            f"model sees {_fmt_sampled(s.grid_x, s.grid_y)} px",
+            f"  {value_label} {s.denoise:.3f}",
+        ]
     f = plan.final
     if f is not None:
-        lines.append(
-            f"| final | {f.src_width}x{f.src_height} -> {f.width}x{f.height} | {f.width / f.src_width:.3f} / "
-            f"{f.height / f.src_height:.3f} | {plan.aspect_deviation(f.width, f.height) * 100:+.2f}% | - | - | - | - "
-            f"| {f.method} | {SIZE_FINAL} |")
-    total = f"- Total {plan.total_tiles} tiles"
+        lines += [
+            "",
+            f"Final: {f.src_width}x{f.src_height} -> {f.width}x{f.height}, x{f.width / f.src_width:.3f} / "
+            f"x{f.height / f.src_height:.3f}, aspect {plan.aspect_deviation(f.width, f.height) * 100:+.2f}%, {f.method}",
+        ]
+    total = f"Total {plan.total_tiles} tiles"
     if sampler_steps:
         total += f" x {sampler_steps} sampler steps"
-    lines += ["", total]
-    warn = [f"- Step {s.index}: {w}" for s in plan.steps for w in s.warnings]
+    lines += ["", total + "."]
+    warn = [f"  Step {s.index}: {w}" for s in plan.steps for w in s.warnings]
     if warn:
-        lines += ["", "### Warnings", *warn]
+        lines += ["", "WARNINGS", *warn]
     if plan.notes:
-        lines += ["", "### Notes", *(f"- {n}" for n in plan.notes)]
+        lines += ["", "NOTES", *(f"  {n}" for n in plan.notes)]
     return "\n".join(lines)
