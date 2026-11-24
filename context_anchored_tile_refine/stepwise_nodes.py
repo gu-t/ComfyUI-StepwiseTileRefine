@@ -1,4 +1,5 @@
-"""The fork's two production nodes: Tile Refine (Any VAE) and Stepwise Tile Upscale.
+"""Two of the fork's three registered nodes: Tile Refine (Any VAE) and Stepwise Tile Upscale (the third,
+Noise Level Scheduler, is in noise_level.py).
 
 Both run the upstream base node's raster engine (sampling.refine_image) with a latent geometry
 read from the VAE (geometry.py), so they work with VAEs whose spatial compression is not 8x,
@@ -238,13 +239,18 @@ class StepwiseTileUpscale:
                    tile_overlap, denoise_first, denoise_last, upscale_model=None, aspect_tolerance=1.0,
                    auto_step_factor=1.5, latent_scale=0, pixel_multiple=0, oversample=1.0,
                    oversample_mode=OVERSAMPLE_CONSTANT, upscale_method=DEFAULT_UPSCALE_METHOD,
-                   downscale_method=DEFAULT_DOWNSCALE_METHOD):
-        from . import stepwise_plan
+                   downscale_method=DEFAULT_DOWNSCALE_METHOD, tile_mode=TILE_BY_TILE):
+        from . import all_at_once, stepwise_plan
 
         geometry = resolve_run_geometry(vae, latent_scale, pixel_multiple)
         auto = auto_tile_cap(guider)
         cap_w = max_tile_width or auto
         cap_h = max_tile_height or auto
+        if tile_mode == all_at_once.SHIFTING:
+            # The shifting grid has no overlap band, so tile_overlap must not reach the plan's fixed
+            # grid solve, where a band the run never uses could fail the plan. Its own check first.
+            all_at_once.tile_cells(cap_w, cap_h, tile_padding, geometry)
+            tile_overlap = 0
         model_scale = None
         if upscale_model is not None:
             model_scale = float(getattr(upscale_model, "scale", 1.0))
@@ -273,7 +279,7 @@ class StepwiseTileUpscale:
             plan = self.build_plan(image, guider, vae, upscale_by, upscale_steps, max_tile_width, max_tile_height,
                                    tile_padding, tile_overlap, denoise_first, denoise_last, upscale_model,
                                    aspect_tolerance, auto_step_factor, latent_scale, pixel_multiple, oversample,
-                                   oversample_mode, upscale_method, downscale_method)
+                                   oversample_mode, upscale_method, downscale_method, tile_mode)
         except grid.GridConfigError as e:
             raise ValueError(_widget_names(str(e))) from e
         schedules = [noise_level.build_schedule(guider.model_patcher, scheduler, steps, s.denoise, denoise_mode)

@@ -15,7 +15,8 @@ this file holds only the rules the code cannot tell you. Upstream's long guide i
 ## Code rules
 
 - Registered nodes are only `StepwiseTileUpscale` and `StepwiseTileRefineAnyVAE`
-  (`stepwise_nodes.py`). Upstream's other nodes stay in the code, unregistered.
+  (`stepwise_nodes.py`) and `StepwiseNoiseLevelScheduler` (`noise_level.py`). Upstream's other
+  nodes stay in the code, unregistered.
 - New widgets go LAST. The frontend restores `widgets_values` by position, so a widget inserted
   mid-list silently shifts every saved workflow. If you must reorder, update `workflows/` and tell
   the owner.

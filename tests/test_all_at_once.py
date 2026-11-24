@@ -480,3 +480,32 @@ def test_the_example_workflow_matches_the_widget_order(comfy_stubs):
     assert len(node["widgets_values"]) == len(widgets)
     values = dict(zip(widgets, node["widgets_values"], strict=True))
     assert values["tile_mode"] == TILE_BY_TILE and values["scheduler"] == "simple" and values["tile_padding"] == 32
+
+
+def test_stepwise_shifting_ignores_tile_overlap_in_the_plan(comfy_stubs):
+    # The shifting grid has no overlap band, so a tile_overlap the fixed grid cannot hold must not
+    # fail the plan. Tile by tile uses the band, and there the same settings still fail.
+    image = _smooth_image(120, 160)
+    args = (ZeroNoise(), ScaleVAE(16, 128), "simple", 4, 3.0, 3, 256, 256, 32, 512, 0.5, 0.2, False)
+    final, _, text = StepwiseTileUpscale().upscale(image, WrapperGuider(), object(), *args, tile_mode=SHIFTING)
+    assert (final.shape[2], final.shape[1]) == (480, 360)
+    assert "tile_overlap 0 px" in text
+    with pytest.raises(ValueError, match="tile_overlap"):
+        StepwiseTileUpscale().upscale(image, _stepwise_guider(), object(), *args, tile_mode=TILE_BY_TILE)
+
+
+def test_stepwise_shifting_names_a_padding_that_leaves_no_core(comfy_stubs):
+    with pytest.raises(ValueError, match="tile_padding"):
+        StepwiseTileUpscale().upscale(_smooth_image(120, 160), WrapperGuider(), object(), ZeroNoise(),
+                                      ScaleVAE(16, 128), "simple", 4, 2.0, 1, 256, 256, 128, 32, 0.5, 0.2, True,
+                                      tile_mode=SHIFTING)
+
+
+@pytest.mark.parametrize("tile_mode", [ALL_AT_ONCE, SHIFTING])
+def test_all_at_once_modes_name_a_wrong_latent_scale(comfy_stubs, tile_mode):
+    # A 16x VAE run as 8x: the canvas latent and its noise disagree, caught before sampling.
+    guider = WrapperGuider()
+    with pytest.raises(RuntimeError, match="latent_scale"):
+        TileRefineAnyVAE().refine(_smooth_image(512, 512), guider, object(), SIGMAS, ScaleVAE(16, 128), ZeroNoise(),
+                                  256, 256, 16, 32, latent_scale=8, tile_mode=tile_mode)
+    assert guider.calls == []

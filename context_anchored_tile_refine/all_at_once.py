@@ -410,6 +410,7 @@ def refine_all_at_once(image, guider, sampler, sigmas, vae, noise, max_tile_widt
     latent = sampling.encode_pixels(vae, padded)
     canvas_noise = sampling.build_canvas_noise(vae, noise, canvas_h, canvas_w, batch, batch_size, batch_index,
                                                latent_scale=geometry.scale)
+    sampling.check_latent_layout(latent, canvas_noise, canvas_w, canvas_h, geometry.scale, "canvas")
     from . import preview
 
     hub = preview.make_hub(preview_mode, guider.model_patcher, (cells_h, cells_w), scale=geometry.scale)

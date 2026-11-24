@@ -767,6 +767,18 @@ def region_gates(region_pixel, canvas_h, canvas_w, latent_scale=8):
     return region_padded, region_latent
 
 
+def check_latent_layout(latent, noise, width, height, scale, what):
+    # Fail fast on any encode/noise layout divergence encode_pixels does not already
+    # resolve — a VAE folding an image batch outside the video family it handles, or a
+    # spatial compression the grid math does not model. A mismatch here would
+    # otherwise broadcast into a cryptic shape error deep inside the sampler or model.
+    if latent.shape != noise.shape:
+        raise RuntimeError(
+            f"VAE encoded a {width}x{height} px {what} to latent shape {tuple(latent.shape)}, but the {what}'s noise is {tuple(noise.shape)}. "
+            "This VAE's latent layout is not supported (e.g. a video VAE folding an image batch "
+            f"into frames, or a VAE whose spatial compression is not the {scale}x this run assumed; set latent_scale to override).")
+
+
 def fold_decoded_frames(decoded):
     # A video-family VAE decodes the 5-D latent to [B,T,H,W,C]. T is folded into the batch
     # exactly as core's VAEDecode node does. Both engines pin one latent row per image with
@@ -886,15 +898,7 @@ def _refine_tiles(image, guider, sampler, sigmas, vae, noise, max_tile_width, ma
                 sampler.sampler_function,
                 extra_options={**sampler.extra_options, "noise_sampler": step_noise.for_window(ly0, ly1, lx0, lx1)},
                 inpaint_options=dict(sampler.inpaint_options))
-        # Fail fast on any encode/noise layout divergence encode_pixels does not already
-        # resolve — a VAE folding an image batch outside the video family it handles, or a
-        # spatial compression the /8 grid math does not model. A mismatch here would
-        # otherwise broadcast into a cryptic shape error deep inside the sampler or model.
-        if tile_latent.shape != tile_noise.shape:
-            raise RuntimeError(
-                f"VAE encoded a {crop.x1 - crop.x0}x{crop.y1 - crop.y0} px tile to latent shape {tuple(tile_latent.shape)}, but the tile's noise slice is {tuple(tile_noise.shape)}. "
-                "This VAE's latent layout is not supported (e.g. a video VAE folding an image batch "
-                f"into frames, or a VAE whose spatial compression is not the {scale}x this run assumed; set latent_scale to override).")
+        check_latent_layout(tile_latent, tile_noise, crop.x1 - crop.x0, crop.y1 - crop.y0, scale, "tile")
         # Binary latent denoise_mask: full-strength denoise over core+overlap
         # (== tile.overlap_inner_rect), frozen only through the context_anchor ring.
         # Binary because the static inpaint blend re-applies this mask every step, so a
