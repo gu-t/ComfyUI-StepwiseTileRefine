@@ -68,9 +68,40 @@ def make_hub(mode, model_patcher, canvas_cells, pixels=None, layout=None, scale=
     if previewer is None:
         return None
     process_in = getattr(model_patcher.model, "process_latent_in", None)
-    return PreviewHub(what, where, grid, previewer.decode_latent_to_preview, canvas_cells, pixels=pixels,
+    return PreviewHub(what, where, grid, safe_decoder(previewer), canvas_cells, pixels=pixels,
                       layout=layout, scale=scale, process_in=process_in,
                       max_size=getattr(latent_preview, "MAX_PREVIEW_RESOLUTION", 512))
+
+
+def _to_image(rgb, scaled=True):
+    # [h, w, 3] in -1..1 (scaled) or 0..1 to a PIL image, with a BLOCKING copy to the CPU.
+    from PIL import Image
+
+    if scaled:
+        rgb = (rgb + 1.0) / 2.0
+    arr = rgb.clamp(0, 1).mul(255).to(torch.uint8).cpu().numpy()
+    return Image.fromarray(arr)
+
+
+def safe_decoder(previewer):
+    """`previewer.decode_latent_to_preview` without core's race. Core's preview_to_image copies the
+    decoded preview to the CPU with non_blocking=True and reads it at once, so a preview made while
+    the GPU is busy (as the all at once wrapper's are, mid model call) can read a reused pinned
+    buffer that still holds an EARLIER preview, of another size: diagonal bands. Latent2RGB is run on
+    a CPU copy of the latent (its own copy is then a no-op) and TAESD's output is copied blocking.
+    Any other previewer only gets a device sync first, which narrows the race but cannot close it."""
+    if getattr(previewer, "latent_rgb_factors", None) is not None:
+        return lambda latent: previewer.decode_latent_to_preview(latent.detach().float().cpu())
+    taesd = getattr(previewer, "taesd", None)
+    if taesd is not None and type(previewer).__name__ == "TAESDPreviewerImpl":
+        return lambda latent: _to_image(taesd.decode(latent[:1])[0, :3].movedim(0, 2))
+
+    def synced(latent):
+        if latent.is_cuda:
+            torch.cuda.synchronize(latent.device)
+        return previewer.decode_latent_to_preview(latent)
+
+    return synced
 
 
 class PreviewHub:

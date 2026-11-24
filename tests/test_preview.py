@@ -32,6 +32,32 @@ class FakePreviewer:
         return ("JPEG", self.decode_latent_to_preview(latent), 512)
 
 
+def test_the_safe_decoder_hands_latent2rgb_a_cpu_latent():
+    # Core's preview_to_image reads a non_blocking GPU->CPU copy at once; on a CPU latent that copy
+    # is a no-op, so the race that drew diagonal bands cannot happen.
+    seen = []
+
+    class Latent2RGB:
+        latent_rgb_factors = ((1, 0, 0),)
+
+        def decode_latent_to_preview(self, latent):
+            seen.append((latent.device.type, latent.dtype))
+            return fake_decode(latent)
+
+    decode = preview.safe_decoder(Latent2RGB())
+    img = decode(torch.rand(1, 3, 4, 5, dtype=torch.float16))
+    assert seen == [("cpu", torch.float32)] and img.size == (5, 4)
+
+
+def test_the_safe_decoder_copies_taesd_output_blocking():
+    class TAESDPreviewerImpl:
+        def __init__(self):
+            self.taesd = type("T", (), {"decode": staticmethod(lambda lat: torch.zeros(1, 3, 6, 7))})()
+
+    img = preview.safe_decoder(TAESDPreviewerImpl())(torch.rand(1, 4, 2, 2))
+    assert img.size == (7, 6) and img.getpixel((0, 0)) == (127, 127, 127)  # 0.5 * 255 truncated, as in core
+
+
 def test_parse_mode():
     assert parse_mode("guess") == ("guess", None, False)
     assert parse_mode("noisy, whole image") == ("noisy", "whole", False)
