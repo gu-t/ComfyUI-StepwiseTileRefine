@@ -1,13 +1,12 @@
 """Whole-image pixel resampling for the Stepwise Tile Upscale node: every method its upscale_method
 and downscale_method widgets offer, in float, on an NHWC IMAGE.
 
-"lanczos" is core's lanczos (upscale._lanczos_resize, an antialiased PIL resize with an 8-bit
-round trip), unchanged so a lanczos run keeps the bytes it always had. Every other method is a
-separable filter applied here in float32. Each output pixel is a normalized weighted sum of
-source pixels ("taps"), and taps beyond the image edge are dropped and the rest renormalized,
-as PIL does. Shrinking widens the kernel by the scale factor, so every source pixel contributes
-however large the reduction ("precise" resampling, as in VirtualDub's precise bicubic), and the
-result has no aliasing from skipped pixels.
+Every method is a separable filter applied here in float32, so a pass never rounds the image to
+8 bits. Each output pixel is a normalized weighted sum of source pixels ("taps"), and taps beyond
+the image edge are dropped and the rest renormalized, as PIL does. Shrinking widens the kernel by
+the scale factor, so every source pixel contributes however large the reduction ("precise"
+resampling, as in VirtualDub's precise bicubic), and the result has no aliasing from skipped
+pixels.
 
     area      exact area average: each output pixel is the mean of the source area it covers,
               with fractional weights at the edges (OpenCV INTER_AREA). Non-negative weights, so
@@ -16,8 +15,10 @@ result has no aliasing from skipped pixels.
     bilinear  triangle kernel. Offered for enlarging only.
     bicubic   the Mitchell-Netravali BC family: (B, C) = (1, 0) B-spline (softest, no ringing),
               (1/3, 1/3) Mitchell, (0, 1/2) Catmull-Rom (PIL's "bicubic").
+    lanczos   Lanczos-3, sinc(x) * sinc(x / 3), PIL's (and so core's) lanczos without the
+              8-bit round trip core's PIL resize takes.
 
-torch + stdlib at module scope; upscale.py (and so PIL) is imported only for lanczos."""
+torch + stdlib at module scope."""
 import math
 
 import torch
@@ -45,14 +46,19 @@ def _triangle(x):
     return (1.0 - x.abs()).clamp(min=0.0)
 
 
+def _lanczos3(x):
+    return torch.where(x.abs() < 3, torch.sinc(x) * torch.sinc(x / 3), torch.zeros_like(x))
+
+
 # name -> (kernel, support in source pixels at scale 1)
 KERNELS = {
     BILINEAR: (_triangle, 1.0),
     B_SPLINE: (_bc_cubic(1.0, 0.0), 2.0),
     MITCHELL: (_bc_cubic(1.0 / 3.0, 1.0 / 3.0), 2.0),
     CATMULL_ROM: (_bc_cubic(0.0, 0.5), 2.0),
+    LANCZOS: (_lanczos3, 3.0),
 }
-METHODS = (LANCZOS, AREA, *KERNELS)
+METHODS = (AREA, *KERNELS)
 
 
 def axis_taps(n_in, n_out, method):
@@ -100,10 +106,6 @@ def resize(image, width, height, method):
     returns the input unchanged."""
     if int(image.shape[2]) == width and int(image.shape[1]) == height:
         return image
-    if method == LANCZOS:
-        from . import upscale
-
-        return upscale._lanczos_resize(image, width, height)
     x = image.to(torch.float32)
     if int(x.shape[1]) != height:
         x = _apply_axis(x, 1, height, method)

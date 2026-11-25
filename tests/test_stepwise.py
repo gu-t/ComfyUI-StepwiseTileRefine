@@ -462,9 +462,9 @@ def test_resample_area_is_the_block_mean():
 
 
 @pytest.mark.parametrize("size", [(87, 65), (40, 30), (13, 9), (200, 150)])
-def test_resample_matches_pil_for_catmull_rom_and_bilinear(size):
-    # PIL's float-mode BICUBIC (Keys a = -0.5, widened when shrinking) and BILINEAR are the same
-    # filters, so both directions must agree to float precision.
+def test_resample_matches_pil_float_filters(size):
+    # PIL's float-mode BICUBIC (Keys a = -0.5, widened when shrinking), BILINEAR and LANCZOS are
+    # the same filters, so both directions must agree to float precision.
     import numpy as np
     from PIL import Image
 
@@ -473,15 +473,32 @@ def test_resample_matches_pil_for_catmull_rom_and_bilinear(size):
     image = torch.rand(1, 97, 131, 3, generator=torch.Generator().manual_seed(2))
     w, h = size
     for method, pil_filter in ((resample.CATMULL_ROM, Image.Resampling.BICUBIC),
-                               (resample.BILINEAR, Image.Resampling.BILINEAR)):
+                               (resample.BILINEAR, Image.Resampling.BILINEAR),
+                               (resample.LANCZOS, Image.Resampling.LANCZOS)):
         ref = np.stack([np.asarray(Image.fromarray(image[0, ..., c].numpy(), "F").resize((w, h), pil_filter))
                         for c in range(3)], -1)
         out = resample.resize(image, w, h, method)[0].numpy()
         assert np.abs(out - np.clip(ref, 0, 1)).max() < 1e-5, method
 
 
-@pytest.mark.parametrize("method", ["area", "bilinear", "bicubic (B-spline)", "bicubic (mitchell)", "bicubic (catmull-rom)"])
-@pytest.mark.parametrize("size", [(23, 17), (140, 100), (70, 51)])
+@pytest.mark.parametrize("size", [(87, 65), (13, 9), (200, 150), (393, 291)])
+def test_resample_lanczos_matches_cores_8_bit_lanczos(comfy_stubs, size):
+    # The float lanczos is core's PIL lanczos minus its 8-bit round trip: on an 8-bit input the
+    # two differ by the output rounding plus PIL's fixed-point weights, about one level. PIL
+    # also clips its intermediate (one axis done) to 0..255, so the levels stay mid-range where
+    # that clip cannot bind.
+    from context_anchored_tile_refine import resample, upscale
+
+    levels = torch.randint(64, 192, (1, 97, 131, 3), generator=torch.Generator().manual_seed(3))
+    image = levels.float() / 255.0
+    w, h = size
+    core = upscale._lanczos_resize(image, w, h)
+    assert (resample.resize(image, w, h, resample.LANCZOS) - core).abs().max() <= 1.5 / 255.0
+
+
+@pytest.mark.parametrize("method", ["area", "bilinear", "bicubic (B-spline)", "bicubic (mitchell)", "bicubic (catmull-rom)",
+                                    "lanczos"])
+@pytest.mark.parametrize("size", [(23, 17), (140, 100), (70, 51), (1, 1), (7, 3)])
 def test_resample_keeps_a_flat_image_flat(method, size):
     from context_anchored_tile_refine import resample
 

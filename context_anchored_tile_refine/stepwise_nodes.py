@@ -147,8 +147,7 @@ def check_stepwise(max_tile_width=None, max_tile_height=None, tile_padding=None,
 def enlarge(image, width, height, upscale_model=None, method="lanczos"):
     # Pixel-space resample of the whole image to exactly width x height: the optional upscale
     # model first, then one resample onto the exact size with `method` (resample.py). A
-    # same-size resample is skipped (for lanczos it is an 8-bit round trip, a loss rather than
-    # an identity).
+    # same-size resample is skipped.
     from . import resample, upscale
 
     current = image
@@ -194,7 +193,7 @@ class StepwiseTileUpscale:
                 "auto_step_factor": ("FLOAT", {"default": 1.5, "min": 1.05, "max": 8.0, "step": 0.05, "tooltip": "Largest growth per pass when upscale_steps is 0 (auto). Unused when upscale_steps is set."}),
                 "oversample": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 8.0, "step": 0.01, "tooltip": "Runs the refine passes this much larger than the output track, then shrinks onto the exact output size after the last pass. The largest pass is input x upscale_by x oversample. Enlarging makes small objects bigger in pixels, so the passes can redraw them. 1 is off."}),
                 "oversample_mode": (list(OVERSAMPLE_MODES), {"default": OVERSAMPLE_CONSTANT, "tooltip": "constant: the first pass jumps to the oversample and every pass keeps it (enlarge, refine, shrink back each pass; at upscale_by 1 every pass runs at one size). ramp up: the passes grow evenly to input x upscale_by x oversample and reach it on the last pass."}),
-                "upscale_method": (list(UPSCALE_METHODS), {"default": DEFAULT_UPSCALE_METHOD, "tooltip": "Filter for every enlargement, soft to sharp. lanczos is core's. The bicubic variants are the Mitchell-Netravali family: B-spline is the softest with no ringing, Catmull-Rom the sharpest."}),
+                "upscale_method": (list(UPSCALE_METHODS), {"default": DEFAULT_UPSCALE_METHOD, "tooltip": "Filter for every enlargement, soft to sharp. lanczos is Lanczos-3 in float. The bicubic variants are the Mitchell-Netravali family: B-spline is the softest with no ringing, Catmull-Rom the sharpest."}),
                 "downscale_method": (list(DOWNSCALE_METHODS), {"default": DEFAULT_DOWNSCALE_METHOD, "tooltip": "Filter for the shrink onto the output size after the last pass (the resamples between passes always enlarge). area is the exact mean of the covered pixels and never rings. Every filter is widened by the shrink factor, so all source pixels count however large the reduction."}),
                 # Strength: how much each pass redraws, and the schedule it samples.
                 "denoise_mode": (list(DENOISE_MODES), {"default": NOISE_LEVEL, "tooltip": "noise level: denoise_first/last are the share of noise each step starts from (0..1, the flow sigma; sigma / (1 + sigma) on SD/SDXL-type models), the same for every scheduler. denoise: they are BasicScheduler denoise values, whose start noise depends on the scheduler and the model's shift. The plan shows both for every step."}),

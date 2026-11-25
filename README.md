@@ -140,7 +140,7 @@ Set `denoise_first` = `denoise_last` for a constant noise level. Recipes, 5 step
 
 Each pass draws its noise on seed + step − 1, so passes at the same size never reuse each other's noise. Same-seed passes reproduce each other's invented detail and overcook the image.
 
-Every shrink widens its filter by the shrink factor, so all source pixels count however large the reduction ("precise" resampling). `area` is the exact mean of the covered pixels and never rings. The bicubic variants are the Mitchell–Netravali family: B-spline is the softest with no ringing, Catmull-Rom (PIL's "bicubic") the sharpest. `lanczos` is core's.
+Every shrink widens its filter by the shrink factor, so all source pixels count however large the reduction ("precise" resampling). `area` is the exact mean of the covered pixels and never rings. The bicubic variants are the Mitchell–Netravali family: B-spline is the softest with no ringing, Catmull-Rom (PIL's "bicubic") the sharpest. `lanczos` is Lanczos-3, the same filter as core's lanczos but without its round trip through 8 bits. Every filter runs in float32, so the passes never round the image to 0–255.
 
 ## Noise level or denoise
 
