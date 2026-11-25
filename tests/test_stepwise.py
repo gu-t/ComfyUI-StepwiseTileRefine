@@ -226,7 +226,9 @@ def test_plan_crop_after_the_canvas_is_reached_does_not_enlarge_again():
 def test_plan_warns_that_a_crop_at_upscale_by_one_resamples(size, warned):
     plan = stepwise_plan.plan_upscale(*size, 1.0, 1, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.3, 0.3)
     text = stepwise_plan.format_plan(plan)
-    assert ("upscale_by 1 on a size off the 16 px grid: the image is enlarged x1.007" in text) == warned
+    assert ("1001x667 is not a multiple of 16 px, so the image is enlarged x1.007 and cropped back, which softens "
+            "it slightly. \"exact, pad edges during denoise\" keeps every pixel as it is." in text) == warned
+    assert "Total 1 tile." in text
     assert ("Output size:" in text) == warned
     pad = stepwise_plan.plan_upscale(*size, 1.0, 1, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.3, 0.3,
                                      output_size=stepwise_plan.OUTPUT_PAD)

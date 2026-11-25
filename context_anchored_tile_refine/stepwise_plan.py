@@ -323,9 +323,9 @@ def plan_upscale(src_width, src_height, factor, steps, geometry, cap_width, cap_
         # The crop's enlargement is all the run does to the size: a near-identity resample.
         ew, eh = enlarge_w or canvas_w, enlarge_h or canvas_h
         plan_warnings.append(
-            f"upscale_by {factor:g} on a size off the {geometry.multiple} px grid: the image is enlarged "
-            f"{_factors(ew / src_width, eh / src_height)} and {_size(ew - target_w, eh - target_h)} px are cropped "
-            f"off its edges, which softens it slightly. output_size \"{OUTPUT_PAD}\" keeps it pixel exact.")
+            f"{target_w}x{target_h} is not a multiple of {geometry.multiple} px, so the image is enlarged "
+            f"{_factors(ew / src_width, eh / src_height)} and cropped back, which softens it slightly. "
+            f"\"{OUTPUT_PAD}\" keeps every pixel as it is.")
 
     plan_steps = []
     prev_w, prev_h = src_width, src_height
@@ -540,9 +540,11 @@ def format_plan(plan, sampler_steps=None, value_label="Denoise", shifting=None, 
         lines += ["", "Final", _op(verb, f"{f.src_width}x{f.src_height} -> {f.width}x{f.height}",
                                    f"{_factors(f.width / f.src_width, f.height / f.src_height)}, {f.method}")]
     if shifting is None:
-        total = f"Total {plan.total_tiles} tiles"
+        count = plan.total_tiles
+        total = f"Total {count} tile{'s' if count != 1 else ''}"
     else:
-        total = f"Total {_fmt_span(sum(w[0] for w in shifting.windows), sum(w[1] for w in shifting.windows))} windows"
+        low, high = sum(w[0] for w in shifting.windows), sum(w[1] for w in shifting.windows)
+        total = f"Total {_fmt_span(low, high)} window{'s' if high != 1 else ''}"
     if sampler_steps:
         total += f" x {sampler_steps} sampler steps"
         if scheduler:
