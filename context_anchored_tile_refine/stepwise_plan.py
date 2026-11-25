@@ -319,17 +319,28 @@ def plan_upscale(src_width, src_height, factor, steps, geometry, cap_width, cap_
     # target itself; otherwise the final resample follows it.
     growth = (factor * oversample if ramp else factor) ** (1.0 / n_steps)
     notes = []
+    if plain and factor <= 1.0 and (canvas_w, canvas_h) != (target_w, target_h):
+        # The crop's enlargement is all the run does to the size: a near-identity resample.
+        ew, eh = enlarge_w or canvas_w, enlarge_h or canvas_h
+        plan_warnings.append(
+            f"upscale_by {factor:g} on a size off the {geometry.multiple} px grid: the image is enlarged "
+            f"{_factors(ew / src_width, eh / src_height)} and {_size(ew - target_w, eh - target_h)} px are cropped "
+            f"off its edges, which softens it slightly. output_size \"{OUTPUT_PAD}\" keeps it pixel exact.")
 
     plan_steps = []
     prev_w, prev_h = src_width, src_height
+    landed = False   # the previous pass already sampled the target's canvas
     for i in range(1, n_steps + 1):
         scale = (factor * oversample) ** (i / n_steps) if ramp else factor ** (i / n_steps) * oversample
         ideal_w, ideal_h = src_width * scale, src_height * scale
         to_w = to_h = 0.0
         if plain and (factor <= 1.0 or i == n_steps):
             width, height, choice = canvas_w, canvas_h, SIZE_FINAL
-            if (prev_w, prev_h) != (canvas_w, canvas_h):
+            if not landed:
+                # Also when an intermediate already has the canvas size: it carries that grid
+                # size's aspect deviation, which the enlargement onto the source's aspect removes.
                 to_w, to_h = enlarge_w, enlarge_h
+            landed = True
         elif i > 1 and abs(growth - 1.0) < 1e-9:
             # No growth between passes (constant oversample at factor 1): the pass keeps the
             # previous size exactly, since a near-identity resample would only soften it.
@@ -343,9 +354,12 @@ def plan_upscale(src_width, src_height, factor, steps, geometry, cap_width, cap_
         warnings = []
         use_model = upscale_model_scale is not None and i == 1
         mw = mh = 0
+        # The filter follows what the resample really reaches: the fractional size it enlarges to
+        # when the step crops, else the step's size.
+        reach_w, reach_h = to_w or width, to_h or height
         if use_model:
             mw, mh = round(prev_w * upscale_model_scale), round(prev_h * upscale_model_scale)
-            method = resample_method(mw, mh, width, height, upscale_method, downscale_method)
+            method = resample_method(mw, mh, reach_w, reach_h, upscale_method, downscale_method)
             if (mw, mh) == (width, height) and not to_w:
                 upscale = f"model x{upscale_model_scale:g}"
             else:
@@ -353,7 +367,7 @@ def plan_upscale(src_width, src_height, factor, steps, geometry, cap_width, cap_
             if mw * mh / 1e6 > MODEL_OUTPUT_WARN_MP:
                 warnings.append(f"upscale model output {mw}x{mh} is {mw * mh / 1e6:.1f} MP")
         else:
-            method = resample_method(prev_w, prev_h, width, height, upscale_method, downscale_method)
+            method = resample_method(prev_w, prev_h, reach_w, reach_h, upscale_method, downscale_method)
             upscale = "none (same size)" if (width, height) == (prev_w, prev_h) and not to_w else method
         if gx.length != width or gy.length != height:
             warnings.append(f"mirrored edge during denoise, {_pad_text(width, height, gx.length, gy.length)}")
@@ -424,7 +438,8 @@ def _resample_op(plan, in_w, in_h, s):
     ew, eh = s.enlarged
     verb = "shrink" if ew <= in_w and eh <= in_h else "enlarge"
     detail = f"{_factors(ew / in_w, eh / in_h)}, {s.method}"
-    # Name the stretch only where it exceeds what whole pixels can hold.
+    # The result's aspect deviation from the source (not this resample's own stretch), named only
+    # where it exceeds what whole pixels can hold.
     deviation = plan.aspect_deviation(ew, eh)
     if abs(deviation) > 0.5 / ew + 0.5 / eh:
         detail += f", aspect {deviation * 100:+.2f}%"
@@ -490,7 +505,9 @@ def format_plan(plan, sampler_steps=None, value_label="Denoise", shifting=None, 
     if plan.oversample != 1.0:
         head += f", oversample x{plan.oversample:g} {plan.oversample_mode}"
     head += f", {n} step{'s' if n != 1 else ''}."
-    if plan.oversample == 1.0 or plan.output_size == OUTPUT_STRETCH:
+    # output_size only acts on a target off the grid, and with oversample only as a stretch.
+    off_grid = asked[0] % g.multiple or asked[1] % g.multiple
+    if off_grid and (plan.oversample == 1.0 or plan.output_size == OUTPUT_STRETCH):
         head += f" Output size: {plan.output_size}."
     # What the model sees at most: the cap on the pixel grid.
     cap = f"{g.round_down(plan.cap_width)}x{g.round_down(plan.cap_height)} px"
@@ -504,7 +521,9 @@ def format_plan(plan, sampler_steps=None, value_label="Denoise", shifting=None, 
         return f"{name} {value} px" + (f" (rounded from {asked})" if asked != value else "")
 
     if shifting is not None:
-        rings = (f"Ring: {ring('tile_padding', plan.context_anchor, asked_anchor)}, core {shifting.core_width}x"
+        # The shifting grid rounds tile_padding on its own (all_at_once.tile_cells), without the
+        # overlap that snap_rings adds into plan.context_anchor.
+        rings = (f"Ring: {ring('tile_padding', shifting.ring, asked_anchor)}, core {shifting.core_width}x"
                  f"{shifting.core_height} px (tile_overlap is not used).")
     elif plan.fixed_grid:
         rings = (f"Rings: {ring('tile_overlap', plan.context_overlap, asked_overlap)}, "

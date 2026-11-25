@@ -168,14 +168,13 @@ def enlarge(image, width, height, upscale_model=None, method="lanczos", virtual=
     return resample.resize(current, width, height, method, virtual)
 
 
-def centre_crop(image, width, height):
-    # The centre width x height of a [B,H,W,C] image (the left and top margins take the odd
-    # pixel, as stepwise_plan.FinalCrop does). A same-size crop is the input.
-    y0 = (int(image.shape[1]) - height) // 2
-    x0 = (int(image.shape[2]) - width) // 2
-    if (x0, y0) == (0, 0) and (int(image.shape[2]), int(image.shape[1])) == (width, height):
-        return image
-    return image[:, y0:y0 + height, x0:x0 + width, :]
+def final_crop(image, crop):
+    # A stepwise_plan.FinalCrop applied to a [B,H,W,C] image, at the offsets the plan computed, so
+    # the plan text and the run cannot disagree on which pixels are kept.
+    if (int(image.shape[2]), int(image.shape[1])) != (crop.src_width, crop.src_height):
+        raise RuntimeError(f"Stepwise Tile Upscale: the crop expects {crop.src_width}x{crop.src_height}, "
+                           f"got {int(image.shape[2])}x{int(image.shape[1])}")
+    return image[:, crop.y0:crop.y0 + crop.height, crop.x0:crop.x0 + crop.width, :]
 
 
 def step_noise(noise, index):
@@ -339,7 +338,7 @@ class StepwiseTileUpscale:
             results.append(current)
         if isinstance(plan.final, stepwise_plan.FinalCrop):
             # A crop is no pass of its own: the last step's image is shown cropped.
-            current = centre_crop(current, plan.final.width, plan.final.height)
+            current = final_crop(current, plan.final)
             results[-1] = current
         elif plan.final is not None:
             current = resample.resize(current, plan.final.width, plan.final.height, plan.final.method)

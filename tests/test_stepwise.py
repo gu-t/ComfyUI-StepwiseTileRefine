@@ -126,6 +126,8 @@ def test_snap_rings_lands_on_cells_and_grid(scale, multiple):
 PLAN_CASES = [
     (1280, 960, 3.0, 3), (1280, 976, 3.0, 3), (2000, 2000, 2.0, 0), (1344, 768, 2.0, 0),
     (1280, 960, 3.0, 1), (1000, 700, 4.0, 0), (777, 555, 2.5, 2), (512, 512, 1.0, 1), (1920, 1080, 1.5, 0),
+    # A small factor in many steps: an intermediate can reach the last pass's canvas size.
+    (1000, 667, 1.02, 3), (1001, 667, 1.0, 2),
 ]
 GEOMETRIES = [LatentGeometry(8, 8), LatentGeometry(16, 16), LatentGeometry(16, 32)]
 
@@ -161,7 +163,10 @@ def test_plan_invariants(w, h, factor, steps, geometry, output_size):
         assert 0 <= last.width - exact[0] < m and 0 <= last.height - exact[1] < m
         assert plan.final == stepwise_plan.FinalCrop(last.width, last.height, *exact, (last.width - exact[0]) // 2,
                                                      (last.height - exact[1]) // 2)
-        ew, eh = last.enlarged
+        # The first pass that lands on the canvas (every pass at upscale_by 1) enlarges onto the
+        # source's aspect; the passes after it keep that size.
+        landing = next(s for s in plan.steps if s.size_choice == stepwise_plan.SIZE_FINAL)
+        ew, eh = landing.enlarged
         assert ew >= last.width and eh >= last.height
         assert abs(plan.aspect_deviation(ew, eh)) < 1.0 / min(ew, eh)
     prev = (w, h)
@@ -195,6 +200,50 @@ def test_plan_crop_without_a_fractional_enlargement():
     assert (step.width, step.height, step.enlarge_width) == (2176, 1632, 0.0)
     assert plan.final == stepwise_plan.FinalCrop(2176, 1632, 2163, 1622, 6, 5)
     assert "centre of" not in stepwise_plan.format_plan(plan)
+
+
+def test_plan_crop_corrects_an_intermediate_at_the_canvas_size():
+    # 1000x667 x1.02 in 3 steps: step 2 is forced up to 1024x688, the canvas of the 1020x680
+    # target, with the grid size's -0.73 % aspect. The last pass still enlarges onto the source's
+    # aspect (an enlargement, so the upscale filter) instead of cropping the stretched intermediate.
+    plan = stepwise_plan.plan_upscale(1000, 667, 1.02, 3, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.3, 0.2)
+    mid, last = plan.steps[1], plan.steps[2]
+    assert (mid.width, mid.height) == (last.width, last.height) == (1024, 688)
+    assert last.enlarged == pytest.approx((1000 * 688 / 667, 688.0))
+    assert last.method == stepwise_plan.DEFAULT_UPSCALE_METHOD
+    assert plan.final == stepwise_plan.FinalCrop(1024, 688, 1020, 680, 2, 4)
+    assert "  enlarge  1024x688 -> 1024x688" in stepwise_plan.format_plan(plan)
+
+
+def test_plan_crop_after_the_canvas_is_reached_does_not_enlarge_again():
+    # upscale_by 1, 1001x667: step 1 enlarges onto 1008x672 and every later pass keeps it as is.
+    plan = stepwise_plan.plan_upscale(1001, 667, 1.0, 3, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.3, 0.2)
+    assert plan.steps[0].enlarge_width > 0
+    assert all(s.enlarge_width == 0 and s.upscale == "none (same size)" for s in plan.steps[1:])
+
+
+@pytest.mark.parametrize("size, warned", [((1001, 667), True), ((1008, 672), False)])
+def test_plan_warns_that_a_crop_at_upscale_by_one_resamples(size, warned):
+    plan = stepwise_plan.plan_upscale(*size, 1.0, 1, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.3, 0.3)
+    text = stepwise_plan.format_plan(plan)
+    assert ("upscale_by 1 on a size off the 16 px grid: the image is enlarged x1.007" in text) == warned
+    assert ("Output size:" in text) == warned
+    pad = stepwise_plan.plan_upscale(*size, 1.0, 1, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.3, 0.3,
+                                     output_size=stepwise_plan.OUTPUT_PAD)
+    assert not pad.warnings
+
+
+def test_plan_text_shows_the_shifting_grids_own_ring():
+    # On an 8 px latent with a 32 px grid, snap_rings turns tile_padding 32 + tile_overlap 8 into a
+    # 56 px anchor. The shifting grid ignores the overlap and runs a 32 px ring, and says so.
+    from context_anchored_tile_refine import all_at_once
+
+    plan = stepwise_plan.plan_upscale(1000, 667, 2.0, 2, LatentGeometry(8, 32), 1024, 1024, 32, 8, 0.4, 0.2,
+                                      fixed_grid=False)
+    assert plan.context_anchor == 56
+    shifting = all_at_once.shifting_tiles(plan, all_at_once.SIZE_FULL, 32)
+    text = stepwise_plan.format_plan(plan, shifting=shifting)
+    assert "Ring: tile_padding 32 px, core 960x960 px (tile_overlap is not used)." in text
 
 
 def test_plan_example_from_the_brief():
