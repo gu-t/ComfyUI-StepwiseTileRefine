@@ -226,7 +226,7 @@ def test_plan_crop_after_the_canvas_is_reached_does_not_enlarge_again():
 def test_plan_warns_that_a_crop_at_upscale_by_one_resamples(size, warned):
     plan = stepwise_plan.plan_upscale(*size, 1.0, 1, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.3, 0.3)
     text = stepwise_plan.format_plan(plan)
-    assert ("width 1001 and height 667 are not a multiple of 16 px, so the image is enlarged x1.007 and cropped "
+    assert ("Width 1001 and height 667 are not multiples of 16 px, so the image is enlarged x1.007 and cropped "
             "back, which softens it slightly. output_size \"exact, pad edges during denoise\" avoids the resample "
             "and keeps every edge pixel." in text) == warned
     assert "Total 1 tile." in text
@@ -240,7 +240,7 @@ def test_plan_warns_that_a_crop_at_upscale_by_one_resamples(size, warned):
 def test_plan_crop_warning_names_only_the_axis_off_the_grid():
     # 1008x667: the width is on the 16 px grid, so only the height is named.
     plan = stepwise_plan.plan_upscale(1008, 667, 1.0, 1, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.3, 0.3)
-    assert plan.warnings[0].startswith("height 667 is not a multiple of 16 px, so the image is enlarged")
+    assert plan.warnings[0].startswith("Height 667 is not a multiple of 16 px, so the image is enlarged")
 
 
 def test_plan_text_shows_the_shifting_grids_own_ring():

@@ -324,8 +324,10 @@ def plan_upscale(src_width, src_height, factor, steps, geometry, cap_width, cap_
         ew, eh = enlarge_w or canvas_w, enlarge_h or canvas_h
         off = [f"{name} {length}" for name, length in (("width", target_w), ("height", target_h))
                if length % geometry.multiple]
+        names = " and ".join(off)
+        multiple = "is not a multiple" if len(off) == 1 else "are not multiples"
         plan_warnings.append(
-            f"{' and '.join(off)} {'is' if len(off) == 1 else 'are'} not a multiple of {geometry.multiple} px, so the "
+            f"{names[0].upper()}{names[1:]} {multiple} of {geometry.multiple} px, so the "
             f"image is enlarged {_factors(ew / src_width, eh / src_height)} and cropped back, which softens it "
             f"slightly. output_size \"{OUTPUT_PAD}\" avoids the resample and keeps every edge pixel.")
 
