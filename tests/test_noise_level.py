@@ -93,14 +93,6 @@ def test_eps_models_use_the_noise_share(comfy_stubs, monkeypatch):
     assert s.start_level == pytest.approx(0.5, abs=0.005)
 
 
-def test_format_schedules_lists_every_step(comfy_stubs, monkeypatch):
-    monkeypatch.setattr(sys.modules["comfy.samplers"], "calculate_sigmas", lambda ms, name, n: flow_simple(n))
-    rows = [build_schedule(_patcher(True), "simple", 25, v, NOISE_LEVEL) for v in (0.35, 0.0)]
-    text = noise_level.format_schedules(rows, "simple", 25)
-    assert "Step 1: noise level 0.350 -> starts at noise level 0.349" in text
-    assert "no sampling" in text
-
-
 def test_scheduler_node(comfy_stubs, monkeypatch):
     monkeypatch.setattr(sys.modules["comfy.samplers"], "calculate_sigmas", lambda ms, name, n: flow_simple(n))
     sigmas, info = noise_level.NoiseLevelScheduler().get_sigmas(_patcher(True), "simple", 25, 0.25)

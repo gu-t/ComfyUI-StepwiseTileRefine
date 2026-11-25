@@ -61,22 +61,24 @@ KERNELS = {
 METHODS = (AREA, *KERNELS)
 
 
-def axis_taps(n_in, n_out, method):
+def axis_taps(n_in, n_out, method, scale=None, start=0.0):
     """(index, weight) for one axis, both [n_out, taps]: output pixel o is
-    sum_k source[index[o, k]] * weight[o, k], and every row of weights sums to 1."""
-    scale = n_in / n_out
+    sum_k source[index[o, k]] * weight[o, k], and every row of weights sums to 1. By default
+    the output spans the source exactly; `scale` (source px per output px) and `start` (the
+    source coordinate of the output's left edge) cut a window out of a fractional resize."""
+    scale = n_in / n_out if scale is None else scale
     out = torch.arange(n_out, dtype=torch.float64)[:, None]
     if method == AREA:
         # Source pixel j covers [j, j + 1); output pixel o covers [o * scale, (o + 1) * scale).
-        taps = math.ceil(scale) + 1
-        index = torch.floor(out * scale) + torch.arange(taps, dtype=torch.float64)[None]
-        lo, hi = out * scale, (out + 1) * scale
+        lo, hi = start + out * scale, start + (out + 1) * scale
+        taps = math.ceil(scale) + 2
+        index = torch.floor(lo) + torch.arange(taps, dtype=torch.float64)[None]
         weight = (torch.minimum(hi, index + 1) - torch.maximum(lo, index)).clamp(min=0.0)
     elif method in KERNELS:
         kernel, support = KERNELS[method]
         stretch = max(scale, 1.0)
         reach = support * stretch
-        center = (out + 0.5) * scale                      # in source coordinates, pixel j centred at j + 0.5
+        center = start + (out + 0.5) * scale              # in source coordinates, pixel j centred at j + 0.5
         taps = math.ceil(2 * reach) + 2
         index = torch.floor(center - 0.5 - reach) + torch.arange(taps, dtype=torch.float64)[None]
         weight = kernel((index + 0.5 - center) / stretch)
@@ -87,8 +89,8 @@ def axis_taps(n_in, n_out, method):
     return index.clamp(0, n_in - 1).long(), weight
 
 
-def _apply_axis(x, dim, n_out, method):
-    index, weight = axis_taps(x.shape[dim], n_out, method)
+def _apply_axis(x, dim, n_out, method, scale=None, start=0.0):
+    index, weight = axis_taps(x.shape[dim], n_out, method, scale, start)
     shape = [1] * x.ndim
     shape[dim] = n_out
     result = None
@@ -101,14 +103,22 @@ def _apply_axis(x, dim, n_out, method):
     return result
 
 
-def resize(image, width, height, method):
+def resize(image, width, height, method, virtual=None):
     """`image` (NHWC, 0..1) resampled to exactly width x height with `method`. A same-size call
-    returns the input unchanged."""
-    if int(image.shape[2]) == width and int(image.shape[1]) == height:
-        return image
+    returns the input unchanged. `virtual` (w, h), floats, resizes to that size instead and keeps
+    its centre width x height, so the scale is exact on both axes however the size rounds."""
+    in_h, in_w = int(image.shape[1]), int(image.shape[2])
     x = image.to(torch.float32)
-    if int(x.shape[1]) != height:
-        x = _apply_axis(x, 1, height, method)
-    if int(x.shape[2]) != width:
-        x = _apply_axis(x, 2, width, method)
+    if virtual is None:
+        if in_w == width and in_h == height:
+            return image
+        if in_h != height:
+            x = _apply_axis(x, 1, height, method)
+        if in_w != width:
+            x = _apply_axis(x, 2, width, method)
+    else:
+        vw, vh = virtual
+        sy, sx = in_h / vh, in_w / vw
+        x = _apply_axis(x, 1, height, method, sy, (vh - height) / 2 * sy)
+        x = _apply_axis(x, 2, width, method, sx, (vw - width) / 2 * sx)
     return x.clamp_(0.0, 1.0).to(image.dtype)

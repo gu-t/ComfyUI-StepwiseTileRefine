@@ -1,4 +1,4 @@
-"""preview_mode: what the node shows in its live preview while it samples (a test-phase widget).
+"""preview_mode: what the node shows in its live preview while it samples.
 torch at module scope; PIL, comfy and latent_preview lazy.
 
 The default, "guess", is core's preview and the path every run took before this widget: the
@@ -33,7 +33,7 @@ PREVIEW_MODES = (
     "grid",
 )
 PREVIEW_MODE_TOOLTIP = (
-    "Test phase. What the live preview shows while the node samples. guess (default): the model's guess of the "
+    "What the live preview shows while the node samples. guess (default): the model's guess of the "
     "finished picture, as in core (per tile in tile by tile, the whole image in the all at once modes). noisy: the "
     "noisy latent, so the noise is seen leaving. change: the amplified difference from the pass's input, so you see "
     "where and how much is redrawn. whole image / one tile at a time: where it is shown. grid: the whole image with "

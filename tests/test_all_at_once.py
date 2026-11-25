@@ -420,9 +420,9 @@ def test_all_at_once_modes_reject_a_mask(comfy_stubs, tile_mode):
                                   mask=torch.ones(1, 64, 64), tile_mode=tile_mode)
 
 
-@pytest.mark.parametrize("tile_mode, heading", [(ALL_AT_ONCE, "TILE MODE: all at once"),
+@pytest.mark.parametrize("tile_mode, heading", [(ALL_AT_ONCE, "Tile mode: all at once, always full"),
                                                 (SHIFTING, "windows per model call"),
-                                                (TILE_BY_TILE, "TILE MODE: tile by tile, always full")])
+                                                (TILE_BY_TILE, "Tile mode: tile by tile, always full")])
 def test_stepwise_node_tile_modes_end_to_end(comfy_stubs, tile_mode, heading):
     image = _smooth_image(120, 160)
     guider = WrapperGuider() if tile_mode != TILE_BY_TILE else _stepwise_guider()
@@ -440,12 +440,12 @@ def test_stepwise_node_tile_modes_end_to_end(comfy_stubs, tile_mode, heading):
 
 STEPWISE_ORDER = [
     "image", "guider", "sampler", "noise", "vae",
-    "upscale_by", "upscale_steps", "auto_step_factor", "oversample", "oversample_mode", "upscale_method",
-    "downscale_method",
+    "upscale_by", "output_size", "upscale_steps", "auto_step_factor", "oversample", "oversample_mode",
+    "upscale_method", "downscale_method",
     "denoise_mode", "denoise_first", "denoise_last", "scheduler", "steps",
     "tile_mode", "tile_size", "max_tile_width", "max_tile_height", "tile_overlap", "tile_padding",
     "plan_only",
-    "upscale_model", "aspect_tolerance", "latent_scale", "pixel_multiple", "preview_mode",
+    "upscale_model", "latent_scale", "pixel_multiple", "preview_mode",
 ]
 ANY_VAE_ORDER = [
     "image", "guider", "sampler", "sigmas", "noise", "vae",
@@ -489,9 +489,47 @@ def test_stepwise_shifting_ignores_tile_overlap_in_the_plan(comfy_stubs):
     args = (ZeroNoise(), ScaleVAE(16, 128), "simple", 4, 3.0, 3, 256, 256, 32, 512, 0.5, 0.2, False)
     final, _, text = StepwiseTileUpscale().upscale(image, WrapperGuider(), object(), *args, tile_mode=SHIFTING)
     assert (final.shape[2], final.shape[1]) == (480, 360)
-    assert "tile_overlap 0 px" in text
+    assert "Ring: tile_padding 32 px, core 192x192 px (tile_overlap is not used)." in text
     with pytest.raises(ValueError, match="tile_overlap"):
         StepwiseTileUpscale().upscale(image, _stepwise_guider(), object(), *args, tile_mode=TILE_BY_TILE)
+
+
+def test_stepwise_shifting_plan_text_shows_the_shifting_grid(comfy_stubs):
+    # The shifting plan gives core and ring once and the windows per step, none of the fixed grid's
+    # tiles. The same settings tile by tile still show the fixed grid.
+    args = (_smooth_image(976, 1280), WrapperGuider(), object(), ZeroNoise(), ScaleVAE(16, 128), "simple", 25, 3.0, 3,
+            1024, 1024, 32, 32, 0.45, 0.22, True)
+    _, _, text = StepwiseTileUpscale().upscale(*args, tile_mode=SHIFTING)
+    assert " tiles" not in text and "do not apply" not in text
+    assert sum(line.startswith("Step ") for line in text.splitlines()) == 3
+    assert "Ring: tile_padding 32 px, core 960x960 px (tile_overlap is not used)." in text
+    assert sum(line.startswith("  denoise ") and line.endswith("windows per model call")
+               for line in text.splitlines()) == 3
+    _, _, fixed = StepwiseTileUpscale().upscale(*args, tile_mode=TILE_BY_TILE)
+    assert " tiles, core " in fixed and "Rings: tile_overlap 32 px, tile_padding 32 px." in fixed
+
+
+@pytest.mark.parametrize("tile_mode, masked", [(TILE_BY_TILE, False), (TILE_BY_TILE, True), (ALL_AT_ONCE, False),
+                                               (SHIFTING, False)])
+def test_tile_refine_any_vae_takes_a_cap_and_rings_off_the_8_grid(comfy_stubs, tile_mode, masked):
+    # Tile Refine (Any VAE) follows the fork's rule: any cap and ring in range. The rings snap up
+    # to the geometry and every crop the model sees stays on the grid and under the cap.
+    assert TileRefineAnyVAE.VALIDATE_INPUTS(1000, 1000, 20, 12) is True
+    image = _smooth_image(1200, 1400)
+    vae = ScaleVAE(16, 128)
+    guider = _stepwise_guider() if tile_mode == TILE_BY_TILE else WrapperGuider()
+    mask = None
+    if masked:
+        mask = torch.zeros(1, 1200, 1400)
+        mask[:, 100:1100, 150:1250] = 1.0
+    (out,) = TileRefineAnyVAE().refine(image, guider, object(), SIGMAS, vae, ZeroNoise(), 1000, 1000, 20, 12,
+                                       mask=mask, tile_mode=tile_mode, tile_size=SIZE_FULL)
+    assert out.shape == image.shape
+    if tile_mode == TILE_BY_TILE:
+        assert len(vae.encode_shapes) > 1
+        assert all(w <= 1000 and h <= 1000 and w % 16 == 0 and h % 16 == 0 for w, h in vae.encode_shapes)
+    else:
+        assert guider.tile_sizes and all(h <= 1000 // 16 and w <= 1000 // 16 for h, w in guider.tile_sizes)
 
 
 def test_stepwise_shifting_names_a_padding_that_leaves_no_core(comfy_stubs):

@@ -488,31 +488,12 @@ def windows_per_call(width, height, core_h, core_w, ring, geometry, tile_size=SI
     return low, high
 
 
-def format_plan(plan, tile_mode, tile_size, context_anchor):
-    """The tile mode section of the Stepwise plan, or "" when the table above says it all."""
+def shifting_tiles(plan, tile_size, context_anchor):
+    """The shifting grid's core, ring and windows per model call on every step of a Stepwise plan,
+    for stepwise_plan.format_plan."""
+    from .stepwise_plan import ShiftingTiles
+
     g = plan.geometry
-    if tile_mode == TILE_BY_TILE:
-        if tile_size != SIZE_FULL:
-            return ""
-        return ("TILE MODE: tile by tile, always full\n"
-                f"  Every tile's frozen ring grows until the model sees {plan.cap_width}x{plan.cap_height} px (inward at "
-                "the image edge), so \"model sees\" above is the bare minimum. Core and band are unchanged.")
-    if tile_mode == ALL_AT_ONCE:
-        lines = ["TILE MODE: all at once",
-                 f"  The tiles above, all stepped together. Bands of {plan.context_overlap} px are weighted together "
-                 f"at every step, and the {plan.context_anchor} px ring is live context at the same noise level."]
-        if tile_size == SIZE_FULL:
-            lines.append(f"  always full: every window grows to {plan.cap_width}x{plan.cap_height} px "
-                         "(identical windows run once).")
-        return "\n".join(lines)
     core_h, core_w, ring = tile_cells(plan.cap_width, plan.cap_height, context_anchor, g)
-    lines = [
-        "TILE MODE: all at once, shifting",
-        f"  Core {core_w * g.scale}x{core_h * g.scale} px, ring {ring * g.scale} px, tile size {tile_size}, a new grid "
-        "offset at every sampler step. The tiles listed above are the fixed grid and do not apply.",
-    ]
-    for s in plan.steps:
-        low, high = windows_per_call(s.width, s.height, core_h, core_w, ring, g, tile_size)
-        span = f"{low}" if low == high else f"{low} to {high}"
-        lines.append(f"  Step {s.index} ({s.width}x{s.height}): {span} windows per model call")
-    return "\n".join(lines)
+    windows = tuple(windows_per_call(s.width, s.height, core_h, core_w, ring, g, tile_size) for s in plan.steps)
+    return ShiftingTiles(core_w * g.scale, core_h * g.scale, ring * g.scale, windows)

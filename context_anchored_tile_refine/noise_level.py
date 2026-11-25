@@ -116,19 +116,6 @@ def build_schedule(model_patcher, scheduler, steps, value, mode=NOISE_LEVEL):
     return Schedule(mode, value, sigmas, total, first, sigma_to_level(first, flow), steps / total)
 
 
-def format_schedules(schedules, scheduler, steps):
-    """Plain text: what each step's setting became in start noise and BasicScheduler terms."""
-    lines = ["", f"NOISE PER STEP ({scheduler}, {steps} sampler steps)"]
-    for i, s in enumerate(schedules, 1):
-        if s.total == 0:
-            lines.append(f"  Step {i}: {s.mode} {s.value:.3f}, no sampling")
-            continue
-        lines.append(
-            f"  Step {i}: {s.mode} {s.value:.3f} -> starts at noise level {s.start_level:.3f} (sigma "
-            f"{s.start_sigma:.4g}, same as denoise {s.denoise:.4f}), the last {steps + 1} of {s.total + 1} sigmas")
-    return "\n".join(lines)
-
-
 class NoiseLevelScheduler:
     """BasicScheduler with the start noise level as the setting instead of denoise."""
 

@@ -42,7 +42,8 @@ Upscales in several steps. Each step enlarges the whole image in pixel space and
 | Input | What it does |
 |---|---|
 | `image`, `guider`, `sampler`, `noise`, `vae` | As for `SamplerCustomAdvanced`. The VAE's latent scale is read automatically. |
-| `upscale_by` | Output size: the final image is exactly `round(input × upscale_by)` on each axis. `1` keeps the input size. |
+| `upscale_by` | Output size: the final image is `round(input × upscale_by)` on each axis (`output_size` says how it lands there). `1` keeps the input size. |
+| `output_size` | How the output lands on `round(input × upscale_by)` when that is not a multiple of the pixel grid (16 px for MOSS). `exact, crop edges` (default): the last step runs a few px larger without stretching and is centre-cropped. `exact, pad edges during denoise`: the right and bottom edges are padded with a mirrored strip while the last step denoises and cut off after; the model may misread the outermost pixels. `stretch image`: the output is the nearest grid size, each axis a few px larger or smaller, and the plan says by how much. With `oversample` the final resample hits the exact size anyway. |
 | `upscale_steps` | Number of refine passes. `0` picks the fewest whose growth per pass stays at or under `auto_step_factor`. |
 | `auto_step_factor` | Largest growth per pass when `upscale_steps` is `0` (default 1.5, so 2 steps for x2 and 3 for x3). Unused when `upscale_steps` is set. |
 | `oversample` | Runs the refine passes this much larger than the output track and shrinks onto the exact output size after the last pass. The largest pass is `input × upscale_by × oversample`. `1` is off. See [The repair loop](#the-repair-loop). |
@@ -58,7 +59,6 @@ Upscales in several steps. Each step enlarges the whole image in pixel space and
 | `tile_padding` | Context outside the overlap band that the model sees and that is thrown away afterwards: frozen in `tile by tile`, live in the `all at once` modes. Rounded up to whole latent cells and the pixel grid. |
 | `plan_only` | Computes and outputs the plan without sampling, so you can check it before a long run. |
 | `upscale_model` (optional) | Used for the first step only, then `upscale_method` to that step's exact size. Later steps use `upscale_method` only, so a 4x model never runs on a large intermediate. |
-| `aspect_tolerance` (advanced) | How much aspect-ratio deviation (percent) an intermediate step may take to get tiles of equal size. `0` keeps the closest exact enlargement. The final step is always exact. |
 | `latent_scale`, `pixel_multiple` (advanced) | See [Other models](#other-models). |
 
 Outputs: the final `image`, `step_images` (the result of every step, as a list since the sizes differ) and `plan`, plain text that is also written to the log when the run starts. Connect `plan` to *Preview as Text*. Node outputs reach other nodes only when the whole node is done, so set `plan_only` to see the plan before a long run.
@@ -117,8 +117,8 @@ The two `all at once` modes put the tiling inside the model call: the sampler ru
 
 ## How the steps are planned
 
-1. The final size is `round(source × upscale_by)`. There is no rounding to 64 and no stretch.
-2. Each step enlarges by about `factor^(1/steps)`. The intermediate sizes are a trade-off between an even factor per step, the right aspect ratio, and sizes where each axis splits into a whole number of **equal** tiles whose cores and sampled crops are multiples of the pixel grid and fit under the tile cap. Within `aspect_tolerance` the planner picks such a size. Otherwise it takes a grid-multiple size, and with tolerance 0 the closest exact enlargement (reflect-padded to the grid and cropped back, so the last tile of an axis can be narrower). The plan shows the factor and the aspect deviation of every step.
+1. The final size is `round(source × upscale_by)`, landed on as `output_size` says.
+2. Each step enlarges by about `factor^(1/steps)`. Every intermediate size is a multiple of the pixel grid (the VAE encodes whole latent cells, so nothing is padded with a mirrored strip): the one nearest the ideal size with the least aspect deviation. On a 16 px grid the aspect stays within about 0.85 % and each step's factor within about 2.4 % of the even factor, worst cases on 0.5 MP sources. The last tile of an axis can be narrower than the others; with `tile_size` `always full` the model still sees a full window. The plan shows the factor and the aspect deviation of every step.
 3. Tiles are never resampled. A tile is cut from the canvas, sampled and pasted back at its native size.
 4. The strength goes linearly per step from `denoise_first` to `denoise_last`, as a noise level or a `BasicScheduler` denoise (`denoise_mode`).
 
@@ -213,7 +213,6 @@ Nothing model-specific is hard-coded. Everything that depends on the model or th
 
 - The VL nodes from upstream are not registered and still assume an 8x VAE.
 - In `tile by tile`, tiles are refined one after another in raster order (upstream's base engine). A seam is hidden by context rings, a thin directional feather, a minimum-error cut and a DC match, not prevented. Very smooth gradients may need a wider `context_overlap`.
-- On the final step, and on intermediate steps the planner could not snap within `aspect_tolerance`, the last tile of an axis can be narrower than the others.
 - `plan_only` still runs the nodes upstream of it (model and text encoder loading), since ComfyUI executes the inputs first.
 - An upscale model runs only on step 1. A fixed 4x model on a large source can still produce a big image there; the plan warns above 40 MP.
 - The `all at once` modes take no `mask` and no ControlNet. They need a guider that keeps its options in `model_options` (CFGGuider and core's guiders do); with any other guider the run stops with an error after the first step instead of running the model untiled.

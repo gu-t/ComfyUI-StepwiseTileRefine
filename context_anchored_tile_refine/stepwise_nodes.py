@@ -11,13 +11,15 @@ import logging
 from typing import ClassVar
 
 from .all_at_once import SIZE_FULL, TILE_BY_TILE, TILE_MODE_TOOLTIP, TILE_MODES, TILE_SIZE_TOOLTIP, TILE_SIZES
-from .node import MAX_RESOLUTION, ContextAnchoredTileRefine, _normalize_mask, _validate_image, check_geometry
+from .node import MAX_RESOLUTION, ContextAnchoredTileRefine, _normalize_mask, _validate_image
 from .noise_level import DENOISE_MODES, NOISE_LEVEL
 from .preview import GUESS, PREVIEW_MODE_TOOLTIP, PREVIEW_MODES
 from .stepwise_plan import (
     DEFAULT_DOWNSCALE_METHOD,
+    DEFAULT_OUTPUT_SIZE,
     DEFAULT_UPSCALE_METHOD,
     DOWNSCALE_METHODS,
+    OUTPUT_SIZES,
     OVERSAMPLE_CONSTANT,
     OVERSAMPLE_MODES,
     UPSCALE_METHODS,
@@ -66,7 +68,7 @@ def _tile_inputs(max_tile):
 
 
 def _preview_inputs():
-    # Test phase, appended last on both nodes (the frontend restores widgets_values by position).
+    # Appended last on both nodes (the frontend restores widgets_values by position).
     return {"preview_mode": (list(PREVIEW_MODES), {"default": GUESS, "tooltip": PREVIEW_MODE_TOOLTIP})}
 
 
@@ -110,7 +112,7 @@ class TileRefineAnyVAE(ContextAnchoredTileRefine):
 
     @classmethod
     def VALIDATE_INPUTS(s, max_tile_width=None, max_tile_height=None, tile_padding=None, tile_overlap=None):
-        return _widget_names(check_geometry(max_tile_width, max_tile_height, tile_padding, tile_overlap))
+        return check_tiles(max_tile_width, max_tile_height, tile_padding, tile_overlap)
 
     CATEGORY = CATEGORY
     SEARCH_ALIASES: ClassVar[list[str]] = ["tiled refine", "tile refine", "any vae", "moss", "flux2", "16x vae"]
@@ -118,42 +120,62 @@ class TileRefineAnyVAE(ContextAnchoredTileRefine):
 
     def refine(self, image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, tile_padding, tile_overlap, mask=None, latent_scale=0, pixel_multiple=0, tile_mode=TILE_BY_TILE, tile_size=SIZE_FULL, preview_mode=GUESS):
         _validate_image(image)
-        message = check_geometry(max_tile_width, max_tile_height, tile_padding, tile_overlap)
+        message = check_tiles(max_tile_width, max_tile_height, tile_padding, tile_overlap)
         if message is not True:
-            raise ValueError(_widget_names(message))
+            raise ValueError(message)
         if mask is not None:
             mask = _normalize_mask(mask, image)
         from . import grid, sampling
 
         geometry = resolve_run_geometry(vae, latent_scale, pixel_multiple)
+        height, width = int(image.shape[1]), int(image.shape[2])
+        if mask is None and (width % geometry.multiple or height % geometry.multiple):
+            logging.warning(
+                "Tile Refine (Any VAE): the image is %dx%d, off the %d px grid, so its right and bottom edges are "
+                "padded with a mirrored strip during denoise. The model may misread the outermost pixels. Feed a "
+                "size that is a multiple of %d px to avoid it.", width, height, geometry.multiple, geometry.multiple)
         try:
             return (sampling.refine_image(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, tile_padding, tile_overlap, mask=mask, geometry=geometry, tile_mode=tile_mode, tile_size=tile_size, preview_mode=preview_mode),)
         except grid.GridConfigError as e:
             raise ValueError(_widget_names(str(e))) from e
 
 
-def check_stepwise(max_tile_width=None, max_tile_height=None, tile_padding=None, tile_overlap=None):
+def check_tiles(max_tile_width=None, max_tile_height=None, tile_padding=None, tile_overlap=None, auto=False):
+    # The fork's tile widget rule, for both nodes: no multiple-of-8 demand, since the rings snap up
+    # to the geometry (geometry.snap_rings) and the grid solver takes any cap. `auto` allows 0 for
+    # the cap (Stepwise picks one for the model family). Returns True or the message.
     for name, value in (("max_tile_width", max_tile_width), ("max_tile_height", max_tile_height)):
-        if value is None or value == 0:
+        if value is None or (auto and value == 0):
             continue
         if value < 256 or value > MAX_RESOLUTION:
-            return f"{name} must be 0 (auto) or between 256 and {MAX_RESOLUTION}, got {value}"
+            low = "0 (auto) or between 256" if auto else "between 256"
+            return f"{name} must be {low} and {MAX_RESOLUTION}, got {value}"
     for name, value in (("tile_padding", tile_padding), ("tile_overlap", tile_overlap)):
         if value is not None and not 0 <= value <= 512:
             return f"{name} must be between 0 and 512, got {value}"
     return True
 
 
-def enlarge(image, width, height, upscale_model=None, method="lanczos"):
+def enlarge(image, width, height, upscale_model=None, method="lanczos", virtual=None):
     # Pixel-space resample of the whole image to exactly width x height: the optional upscale
-    # model first, then one resample onto the exact size with `method` (resample.py). A
-    # same-size resample is skipped.
+    # model first, then one resample onto the exact size with `method` (resample.py), or onto
+    # the centre of the fractional size `virtual`. A same-size resample is skipped.
     from . import resample, upscale
 
     current = image
     if upscale_model is not None:
         current = upscale._upscale_with_model(upscale_model, current)
-    return resample.resize(current, width, height, method)
+    return resample.resize(current, width, height, method, virtual)
+
+
+def centre_crop(image, width, height):
+    # The centre width x height of a [B,H,W,C] image (the left and top margins take the odd
+    # pixel, as stepwise_plan.FinalCrop does). A same-size crop is the input.
+    y0 = (int(image.shape[1]) - height) // 2
+    x0 = (int(image.shape[2]) - width) // 2
+    if (x0, y0) == (0, 0) and (int(image.shape[2]), int(image.shape[1])) == (width, height):
+        return image
+    return image[:, y0:y0 + height, x0:x0 + width, :]
 
 
 def step_noise(noise, index):
@@ -173,8 +195,8 @@ def step_noise(noise, index):
 
 class StepwiseTileUpscale:
     """Upscales in several steps. Each step enlarges in pixel space and runs a tile refine, with
-    strength (start noise level or denoise) falling from the first step to the last. The final
-    size is exact."""
+    strength (start noise level or denoise) falling from the first step to the last. Every step
+    samples a size on the pixel grid; output_size says how the output lands on the target."""
 
     @classmethod
     def INPUT_TYPES(s):
@@ -188,7 +210,8 @@ class StepwiseTileUpscale:
                 "noise": ("NOISE", {"tooltip": "Noise is drawn once per step for the entire image and sliced for each tile."}),
                 "vae": ("VAE", {"tooltip": "The VAE that encodes and decodes each tile. Its latent scale is read automatically."}),
                 # Size: how big the output gets and in how many passes.
-                "upscale_by": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 16.0, "step": 0.01, "tooltip": "Output size: the final image is exactly round(input x upscale_by) on each axis. 1 keeps the input size (a pure repair run with oversample)."}),
+                "upscale_by": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 16.0, "step": 0.01, "tooltip": "Output size: the final image is round(input x upscale_by) on each axis (output_size says how it lands there). 1 keeps the input size (a pure repair run with oversample)."}),
+                "output_size": (list(OUTPUT_SIZES), {"default": DEFAULT_OUTPUT_SIZE, "tooltip": "How the output lands on round(input x upscale_by) when that is not a multiple of the pixel grid (16 px for MOSS). Every step before it is always on the grid. exact, crop edges: the last step runs a few px larger without stretching and is centre-cropped, so a few px of picture are lost at the edges. exact, pad edges during denoise: the right and bottom edges are padded with a mirrored strip while the last step denoises and cut off after; nothing mirrored is left in the image, but the model may misread the outermost pixels. stretch image: the output is the grid size nearest the target, each axis a few px larger or smaller, so the aspect changes slightly; the plan says by how much. With oversample the final resample hits the exact size, so only stretch image changes anything there."}),
                 "upscale_steps": ("INT", {"default": 0, "min": 0, "max": 16, "tooltip": "Number of refine passes. 0 picks the fewest whose growth per pass is at most auto_step_factor."}),
                 "auto_step_factor": ("FLOAT", {"default": 1.5, "min": 1.05, "max": 8.0, "step": 0.05, "tooltip": "Largest growth per pass when upscale_steps is 0 (auto). Unused when upscale_steps is set."}),
                 "oversample": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 8.0, "step": 0.01, "tooltip": "Runs the refine passes this much larger than the output track, then shrinks onto the exact output size after the last pass. The largest pass is input x upscale_by x oversample. Enlarging makes small objects bigger in pixels, so the passes can redraw them. 1 is off."}),
@@ -210,7 +233,6 @@ class StepwiseTileUpscale:
             },
             "optional": {
                 "upscale_model": ("UPSCALE_MODEL", {"tooltip": "Optional. Used for the first step only, then upscale_method to that step's exact size."}),
-                "aspect_tolerance": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.1, "advanced": True, "tooltip": "Percent of aspect-ratio deviation an intermediate step may take to land on a size that splits into equal tiles. 0 keeps the closest exact enlargement (the last tile may then be narrower). The final step is always exact."}),
                 **_latent_geometry_inputs(),
                 **_preview_inputs(),
             },
@@ -220,7 +242,7 @@ class StepwiseTileUpscale:
     RETURN_NAMES = ("image", "step_images", "plan")
     OUTPUT_IS_LIST = (False, True, False)
     OUTPUT_TOOLTIPS = (
-        "The final image at exactly round(input x upscale_by).",
+        "The final image at round(input x upscale_by), or the grid size nearest it (output_size).",
         "The result of every step, for inspection (a list, since the sizes differ).",
         "The plan as plain text: sizes, factors, aspect deviation, tiles and what the model sees, rings, noise and enlargement per step.",
     )
@@ -231,11 +253,11 @@ class StepwiseTileUpscale:
 
     @classmethod
     def VALIDATE_INPUTS(s, max_tile_width=None, max_tile_height=None, tile_padding=None, tile_overlap=None):
-        return check_stepwise(max_tile_width, max_tile_height, tile_padding, tile_overlap)
+        return check_tiles(max_tile_width, max_tile_height, tile_padding, tile_overlap, auto=True)
 
     @staticmethod
     def build_plan(image, guider, vae, upscale_by, upscale_steps, max_tile_width, max_tile_height, tile_padding,
-                   tile_overlap, denoise_first, denoise_last, upscale_model=None, aspect_tolerance=1.0,
+                   tile_overlap, denoise_first, denoise_last, upscale_model=None, output_size=DEFAULT_OUTPUT_SIZE,
                    auto_step_factor=1.5, latent_scale=0, pixel_multiple=0, oversample=1.0,
                    oversample_mode=OVERSAMPLE_CONSTANT, upscale_method=DEFAULT_UPSCALE_METHOD,
                    downscale_method=DEFAULT_DOWNSCALE_METHOD, tile_mode=TILE_BY_TILE):
@@ -256,18 +278,19 @@ class StepwiseTileUpscale:
         return stepwise_plan.plan_upscale(
             int(image.shape[2]), int(image.shape[1]), float(upscale_by), int(upscale_steps), geometry, cap_w, cap_h,
             int(tile_padding), int(tile_overlap), float(denoise_first), float(denoise_last),
-            aspect_tolerance=float(aspect_tolerance) / 100.0, upscale_model_scale=model_scale,
+            upscale_model_scale=model_scale,
             auto_step_factor=float(auto_step_factor), oversample=float(oversample), oversample_mode=oversample_mode,
-            upscale_method=upscale_method, downscale_method=downscale_method)
+            upscale_method=upscale_method, downscale_method=downscale_method,
+            fixed_grid=tile_mode != all_at_once.SHIFTING, output_size=output_size)
 
     def upscale(self, image, guider, sampler, noise, vae, scheduler, steps, upscale_by, upscale_steps, max_tile_width,
                 max_tile_height, tile_padding, tile_overlap, denoise_first, denoise_last, plan_only,
-                upscale_model=None, aspect_tolerance=1.0, auto_step_factor=1.5, latent_scale=0, pixel_multiple=0,
+                upscale_model=None, auto_step_factor=1.5, latent_scale=0, pixel_multiple=0,
                 denoise_mode=NOISE_LEVEL, oversample=1.0, oversample_mode=OVERSAMPLE_CONSTANT,
                 upscale_method=DEFAULT_UPSCALE_METHOD, downscale_method=DEFAULT_DOWNSCALE_METHOD,
-                tile_mode=TILE_BY_TILE, tile_size=SIZE_FULL, preview_mode=GUESS):
+                tile_mode=TILE_BY_TILE, tile_size=SIZE_FULL, preview_mode=GUESS, output_size=DEFAULT_OUTPUT_SIZE):
         _validate_image(image)
-        message = check_stepwise(max_tile_width, max_tile_height, tile_padding, tile_overlap)
+        message = check_tiles(max_tile_width, max_tile_height, tile_padding, tile_overlap, auto=True)
         if message is not True:
             raise ValueError(message)
         if float(upscale_by) < 1.0:
@@ -277,20 +300,18 @@ class StepwiseTileUpscale:
         try:
             plan = self.build_plan(image, guider, vae, upscale_by, upscale_steps, max_tile_width, max_tile_height,
                                    tile_padding, tile_overlap, denoise_first, denoise_last, upscale_model,
-                                   aspect_tolerance, auto_step_factor, latent_scale, pixel_multiple, oversample,
+                                   output_size, auto_step_factor, latent_scale, pixel_multiple, oversample,
                                    oversample_mode, upscale_method, downscale_method, tile_mode)
         except grid.GridConfigError as e:
             raise ValueError(_widget_names(str(e))) from e
         schedules = [noise_level.build_schedule(guider.model_patcher, scheduler, steps, s.denoise, denoise_mode)
                      for s in plan.steps]
         label = "Noise level" if denoise_mode == NOISE_LEVEL else "Denoise"
-        text = stepwise_plan.format_plan(plan, steps, value_label=label)
-        text += "\n" + noise_level.format_schedules(schedules, scheduler, steps)
         from . import all_at_once
 
-        mode_text = all_at_once.format_plan(plan, tile_mode, tile_size, tile_padding)
-        if mode_text:
-            text += "\n\n" + mode_text
+        shifting = all_at_once.shifting_tiles(plan, tile_size, tile_padding) if tile_mode == all_at_once.SHIFTING else None
+        text = stepwise_plan.format_plan(plan, steps, value_label=label, shifting=shifting, schedules=schedules,
+                                         tile_mode=tile_mode, tile_size=tile_size, scheduler=scheduler)
         logging.info("Stepwise Tile Upscale:\n%s", text)
         if plan_only:
             return (image, [image], text)
@@ -304,7 +325,8 @@ class StepwiseTileUpscale:
             logging.info("Stepwise Tile Upscale: step %d/%d, %dx%d -> %dx%d, start noise %.3f (denoise %.4f), %d tiles",
                          step.index, len(plan.steps), step.src_width, step.src_height, step.width, step.height,
                          schedule.start_level, schedule.denoise, step.tiles)
-            current = enlarge(current, step.width, step.height, upscale_model if step.use_model else None, step.method)
+            current = enlarge(current, step.width, step.height, upscale_model if step.use_model else None, step.method,
+                              step.enlarged if step.enlarge_width else None)
             current = sampling.refine_image(
                 current, guider, sampler, schedule.sigmas, vae, step_noise(noise, step.index), plan.cap_width,
                 plan.cap_height, tile_padding if tile_mode == all_at_once.SHIFTING else plan.context_anchor, plan.context_overlap,
@@ -315,7 +337,11 @@ class StepwiseTileUpscale:
                     f"Stepwise Tile Upscale: step {step.index} produced {int(current.shape[2])}x{int(current.shape[1])}, "
                     f"expected {step.width}x{step.height}")
             results.append(current)
-        if plan.final is not None:
+        if isinstance(plan.final, stepwise_plan.FinalCrop):
+            # A crop is no pass of its own: the last step's image is shown cropped.
+            current = centre_crop(current, plan.final.width, plan.final.height)
+            results[-1] = current
+        elif plan.final is not None:
             current = resample.resize(current, plan.final.width, plan.final.height, plan.final.method)
             results.append(current)
         return (current, results, text)

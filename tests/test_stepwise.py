@@ -132,16 +132,38 @@ GEOMETRIES = [LatentGeometry(8, 8), LatentGeometry(16, 16), LatentGeometry(16, 3
 
 @pytest.mark.parametrize("w, h, factor, steps", PLAN_CASES)
 @pytest.mark.parametrize("geometry", GEOMETRIES, ids=["g8", "g16", "g32"])
-@pytest.mark.parametrize("tolerance", [0.0, 0.01, 0.03])
-def test_plan_invariants(w, h, factor, steps, geometry, tolerance):
+@pytest.mark.parametrize("output_size", stepwise_plan.OUTPUT_SIZES)
+def test_plan_invariants(w, h, factor, steps, geometry, output_size):
     cap = 1024
-    plan = stepwise_plan.plan_upscale(w, h, factor, steps, geometry, cap, cap, 32, 32, 0.45, 0.22, tolerance)
+    plan = stepwise_plan.plan_upscale(w, h, factor, steps, geometry, cap, cap, 32, 32, 0.45, 0.22,
+                                      output_size=output_size)
     m = geometry.multiple
-    # Exact final size, no 64-rounding and no stretch.
-    assert (plan.width, plan.height) == (round(w * factor), round(h * factor))
-    assert (plan.steps[-1].width, plan.steps[-1].height) == (plan.width, plan.height)
+    exact = (round(w * factor), round(h * factor))
+    if output_size == stepwise_plan.OUTPUT_STRETCH:
+        # The nearest grid size, and a warning whenever it is not the exact target.
+        assert plan.width % m == 0 and plan.height % m == 0
+        assert abs(plan.width - exact[0]) <= 2 * m and abs(plan.height - exact[1]) <= 2 * m
+        assert bool(plan.warnings) == ((plan.width, plan.height) != exact)
+    else:
+        assert (plan.width, plan.height) == exact
     if steps:
         assert len(plan.steps) == steps
+    last = plan.steps[-1]
+    if output_size == stepwise_plan.OUTPUT_PAD:
+        assert (last.width, last.height) == exact and plan.final is None
+    else:
+        # Every pass samples a size on the grid, so nothing is padded.
+        assert all(s.width % m == 0 and s.height % m == 0 for s in plan.steps)
+        assert not any("padded" in warning for s in plan.steps for warning in s.warnings)
+    if output_size == stepwise_plan.OUTPUT_CROP and (last.width, last.height) != exact:
+        # The last pass is the grid size just above the target, enlarged without stretch and cut
+        # down onto the target.
+        assert 0 <= last.width - exact[0] < m and 0 <= last.height - exact[1] < m
+        assert plan.final == stepwise_plan.FinalCrop(last.width, last.height, *exact, (last.width - exact[0]) // 2,
+                                                     (last.height - exact[1]) // 2)
+        ew, eh = last.enlarged
+        assert ew >= last.width and eh >= last.height
+        assert abs(plan.aspect_deviation(ew, eh)) < 1.0 / min(ew, eh)
     prev = (w, h)
     for step in plan.steps:
         assert (step.src_width, step.src_height) == prev
@@ -160,23 +182,67 @@ def test_plan_invariants(w, h, factor, steps, geometry, tolerance):
             assert (sol.n, sol.base) == (g.n, g.base)
         if step.index < len(plan.steps) and factor > 1:
             assert step.width > step.src_width and step.height > step.src_height
-            if step.size_choice in (stepwise_plan.SIZE_EVEN, stepwise_plan.SIZE_GRID):
-                assert step.width % m == 0 and step.height % m == 0
-                assert abs(plan.aspect_deviation(step.width, step.height)) <= tolerance + 1e-9
-            if step.size_choice == stepwise_plan.SIZE_EVEN:
-                assert step.grid_x.even and step.grid_y.even
-            if tolerance == 0.0:
-                assert step.size_choice == stepwise_plan.SIZE_EXACT
+            assert step.size_choice == stepwise_plan.SIZE_GRID
+            # Within one grid cell of the shorter side in aspect.
+            assert abs(plan.aspect_deviation(step.width, step.height)) <= m / min(step.width, step.height)
+
+
+def test_plan_crop_without_a_fractional_enlargement():
+    # 1664x1248 x1.3 is 2163x1622; 4:3 fits 2176x1632 exactly, so the step resamples straight onto it
+    # and only the final crop remains.
+    plan = stepwise_plan.plan_upscale(1664, 1248, 1.3, 1, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.35, 0.35)
+    step = plan.steps[0]
+    assert (step.width, step.height, step.enlarge_width) == (2176, 1632, 0.0)
+    assert plan.final == stepwise_plan.FinalCrop(2176, 1632, 2163, 1622, 6, 5)
+    assert "centre of" not in stepwise_plan.format_plan(plan)
 
 
 def test_plan_example_from_the_brief():
-    # 1280x960 x3 in 3 steps on MOSS (16 px grid): every intermediate splits into equal tiles.
-    plan = stepwise_plan.plan_upscale(1280, 960, 3.0, 3, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.45, 0.22, 0.01)
+    # 1280x960 x3 in 3 steps on MOSS (16 px grid): every pass on the grid, the factor even.
+    plan = stepwise_plan.plan_upscale(1280, 960, 3.0, 3, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.45, 0.22)
     assert [(s.width, s.height) for s in plan.steps][-1] == (3840, 2880)
-    assert all(s.size_choice == stepwise_plan.SIZE_EVEN for s in plan.steps[:-1])
+    assert all(s.width % 16 == 0 and s.height % 16 == 0 for s in plan.steps)
     assert [round(s.denoise, 3) for s in plan.steps] == [0.45, 0.335, 0.22]
     factors = [s.factor_x for s in plan.steps]
-    assert max(factors) / min(factors) < 1.05
+    assert max(factors) / min(factors) < 1.02
+
+
+@pytest.mark.parametrize("output_size, ops, warning", [
+    # 1920x1080 x1.5 is 2880x1620, and 1620 is off the 16 px grid.
+    (stepwise_plan.OUTPUT_CROP, [
+        "  enlarge  1920x1080 -> 2880x1632   x1.511, lanczos, centre of 2901.3x1632",
+        "  denoise  2880x1632                4x2 tiles, core 720x816",
+        "  crop     2880x1632 -> 2880x1620",
+    ], None),
+    (stepwise_plan.OUTPUT_PAD, [
+        "  enlarge  1920x1080 -> 2880x1620   x1.500, lanczos",
+        "  pad      2880x1620 -> 2880x1632   mirrored",
+        "  denoise  2880x1632                4x2 tiles, core 720x816",
+        "  crop     2880x1632 -> 2880x1620",
+    ], "Step 1: mirrored edge during denoise, 12 px at the bottom"),
+    (stepwise_plan.OUTPUT_STRETCH, [
+        "  enlarge  1920x1080 -> 2880x1616   x1.500 / x1.496, lanczos, aspect +0.25%",
+        "  denoise  2880x1616                4x2 tiles, core 720x816/800",
+    ], "Output 2880x1616 instead of 2880x1620: height -4 px (-0.25%)"),
+])
+def test_plan_output_size(output_size, ops, warning):
+    # The plan lists every operation of a step in the order it runs.
+    plan = stepwise_plan.plan_upscale(1920, 1080, 1.5, 1, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.4, 0.4,
+                                      output_size=output_size)
+    text = stepwise_plan.format_plan(plan, value_label="Noise level")
+    assert f"Source 1920x1080, x1.5 -> 2880x1620, 1 step. Output size: {output_size}." in text
+    lines = text.splitlines()
+    first = lines.index("Step 1, noise level 0.400") + 1
+    assert lines[first:first + len(ops)] == ops
+    assert f"Output {plan.width}x{plan.height}." in text
+    if output_size == stepwise_plan.OUTPUT_CROP:
+        # One exact factor on both axes: the centre of 2901.33x1632, then cut onto 2880x1620.
+        assert plan.steps[0].enlarged == pytest.approx((1920 * 1632 / 1080, 1632.0))
+        assert plan.final == stepwise_plan.FinalCrop(2880, 1632, 2880, 1620, 0, 6)
+    if warning is None:
+        assert "WARNINGS" not in text
+    else:
+        assert warning in text
 
 
 def test_auto_step_count_and_denoise():
@@ -190,25 +256,34 @@ def test_auto_step_count_and_denoise():
 
 
 def test_plan_uses_the_upscale_model_on_step_one_only():
-    plan = stepwise_plan.plan_upscale(1280, 960, 3.0, 3, EIGHT, 1024, 1024, 32, 32, 0.4, 0.2, 0.01, upscale_model_scale=4.0)
+    plan = stepwise_plan.plan_upscale(1280, 960, 3.0, 3, EIGHT, 1024, 1024, 32, 32, 0.4, 0.2, upscale_model_scale=4.0)
     assert [s.use_model for s in plan.steps] == [True, False, False]
     assert plan.steps[0].upscale.startswith("model x4")
     assert all(s.upscale == "lanczos" for s in plan.steps[1:])
 
 
 def test_plan_text_lists_every_step():
-    plan = stepwise_plan.plan_upscale(1280, 976, 3.0, 3, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.45, 0.22, 0.01)
+    plan = stepwise_plan.plan_upscale(1280, 976, 3.0, 3, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.45, 0.22)
     text = stepwise_plan.format_plan(plan, 25)
-    assert "1280x976 -> target 3840x2928" in text
+    assert "Source 1280x976, x3 -> 3840x2928" in text
     assert sum(line.startswith("Step ") for line in text.splitlines()) == len(plan.steps)
     assert "|" not in text and "#" not in text
-    assert "Latent cell 16 px" in text
+    assert "Pixel grid 16 px." in text
+
+
+def test_plan_names_the_tile_the_model_sees_on_the_grid():
+    # A cap off the 16 px grid: every window lands on the grid below it.
+    plan = stepwise_plan.plan_upscale(1000, 750, 2.0, 2, LatentGeometry(16, 16), 1000, 1000, 32, 32, 0.4, 0.2)
+    text = stepwise_plan.format_plan(plan, tile_mode="tile by tile", tile_size="always full")
+    assert "Tile mode: tile by tile, always full. Max tile 992x992 px, rings included." in text
 
 
 def test_plan_reports_rounded_rings():
-    plan = stepwise_plan.plan_upscale(1000, 1000, 2.0, 2, LatentGeometry(16, 32), 1024, 1024, 24, 8, 0.4, 0.2, 0.01)
+    plan = stepwise_plan.plan_upscale(1000, 1000, 2.0, 2, LatentGeometry(16, 32), 1024, 1024, 24, 8, 0.4, 0.2)
     assert (plan.context_anchor, plan.context_overlap) == (48, 16)
-    assert any("rings rounded up" in n for n in plan.notes)
+    text = stepwise_plan.format_plan(plan)
+    assert "Rings: tile_overlap 16 px (rounded from 8), tile_padding 48 px (rounded from 24)." in text
+    assert "NOTES" not in text
 
 
 # --- the raster engine at any latent scale ----------------------------------------------------
@@ -293,7 +368,10 @@ def test_any_vae_node_inputs_rename_upstreams_rings():
     for name in ("image", "guider", "sampler", "sigmas", "vae", "noise", "max_tile_width", "max_tile_height"):
         assert fork["required"][name] == upstream["required"][name]
     assert {"mask", "latent_scale", "pixel_multiple"} <= set(fork["optional"])
-    assert TileRefineAnyVAE.VALIDATE_INPUTS(tile_padding=12) == "tile_padding must be a multiple of 8, got 12"
+    # The fork's own rule (stepwise_nodes.check_tiles): no multiple-of-8 demand, and no auto cap.
+    assert TileRefineAnyVAE.VALIDATE_INPUTS(1000, 1000, 12, 20) is True
+    assert TileRefineAnyVAE.VALIDATE_INPUTS(tile_padding=600) == "tile_padding must be between 0 and 512, got 600"
+    assert TileRefineAnyVAE.VALIDATE_INPUTS(max_tile_width=0) == "max_tile_width must be between 256 and 16384, got 0"
 
 
 # --- the stepwise node end to end -------------------------------------------------------------
@@ -325,6 +403,23 @@ def test_stepwise_node_end_to_end(comfy_stubs, scale, channels, multiple, src, f
         assert cw % (multiple or scale) == 0 and ch % (multiple or scale) == 0 and cw <= 256 and ch <= 256
 
 
+@pytest.mark.parametrize("output_size, size", [(stepwise_plan.OUTPUT_CROP, (480, 366)),
+                                               (stepwise_plan.OUTPUT_PAD, (480, 366)),
+                                               (stepwise_plan.OUTPUT_STRETCH, (480, 368))])
+def test_stepwise_node_output_size(comfy_stubs, output_size, size):
+    # 160x122 x3 is 480x366, off the 16 px grid. Only pad edges hands the VAE a padded canvas
+    # (the tiles of a padded canvas are on the grid too, so the encodes cannot tell): the other
+    # two sample grid sizes on every step, which their step images show.
+    vae = ScaleVAE(16, 128)
+    final, step_images, text = StepwiseTileUpscale().upscale(
+        _smooth_image(122, 160), _stepwise_guider(), object(), ZeroNoise(), vae, "simple", 4, 3.0, 2, 256, 256, 32, 32,
+        0.5, 0.2, False, output_size=output_size)
+    assert (final.shape[2], final.shape[1]) == size
+    assert len(step_images) == 2 and step_images[-1] is final
+    assert all(img.shape[1] % 16 == 0 and img.shape[2] % 16 == 0 for img in step_images[:-1])
+    assert ("mirrored" in text) == (output_size == stepwise_plan.OUTPUT_PAD)
+
+
 def test_stepwise_plan_only_samples_nothing(comfy_stubs):
     vae = ScaleVAE(16, 128)
     image = _smooth_image(120, 160)
@@ -333,7 +428,7 @@ def test_stepwise_plan_only_samples_nothing(comfy_stubs):
         image, guider, object(), ZeroNoise(), vae, "simple", 4, 3.0, 3, 0, 0, 32, 32, 0.45, 0.22, True)
     assert final is image and steps == [image]
     assert guider.calls == [] and vae.encode_shapes == []
-    assert "max tile 1024x1024" in text
+    assert "Max tile 1024x1024 px" in text
 
 
 def test_stepwise_denoise_drives_the_sigmas(comfy_stubs):
@@ -359,8 +454,20 @@ def test_auto_tile_cap_by_family():
 def test_validate_inputs():
     assert StepwiseTileUpscale.VALIDATE_INPUTS(0, 0, 32, 32) is True
     assert StepwiseTileUpscale.VALIDATE_INPUTS(1024, 768, 0, 0) is True
-    assert isinstance(StepwiseTileUpscale.VALIDATE_INPUTS(100, 0, 32, 32), str)
+    assert StepwiseTileUpscale.VALIDATE_INPUTS(1000, 0, 12, 20) is True
+    assert StepwiseTileUpscale.VALIDATE_INPUTS(100, 0, 32, 32) == "max_tile_width must be 0 (auto) or between 256 and 16384, got 100"
     assert isinstance(StepwiseTileUpscale.VALIDATE_INPUTS(0, 0, 600, 32), str)
+
+
+# --- the shifting tile mode ----------------------------------------------------------------------
+
+def test_plan_sizes_do_not_depend_on_the_tile_mode():
+    args = (1280, 976, 3.0, 3, LatentGeometry(16, 16), 1024, 1024, 32, 0, 0.45, 0.22)
+    fixed = stepwise_plan.plan_upscale(*args)
+    shifting = stepwise_plan.plan_upscale(*args, fixed_grid=False)
+    assert [(s.width, s.height) for s in shifting.steps] == [(s.width, s.height) for s in fixed.steps]
+    assert fixed.fixed_grid and not shifting.fixed_grid
+    assert all(s.width % 16 == 0 and s.height % 16 == 0 and not s.warnings for s in shifting.steps)
 
 
 # --- the repair loop: oversample, oversample_mode, the resample methods -----------------------
@@ -368,7 +475,7 @@ def test_validate_inputs():
 def test_plan_constant_oversample_at_upscale_by_one_refines_at_one_size():
     # K: pass 1 enlarges by the oversample, every later pass keeps that size exactly, and the
     # final resample shrinks back onto the source size.
-    plan = stepwise_plan.plan_upscale(1152, 864, 1.0, 5, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.7, 0.7, 0.01,
+    plan = stepwise_plan.plan_upscale(1152, 864, 1.0, 5, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.7, 0.7,
                                       oversample=1.5)
     assert (plan.width, plan.height) == (1152, 864)
     first = (plan.steps[0].width, plan.steps[0].height)
@@ -377,13 +484,12 @@ def test_plan_constant_oversample_at_upscale_by_one_refines_at_one_size():
     assert all(s.size_choice == stepwise_plan.SIZE_SAME for s in plan.steps[1:])
     assert [s.upscale for s in plan.steps[1:]] == ["none (same size)"] * 4
     assert plan.final == stepwise_plan.FinalResample(*first, 1152, 864, "area")
-    assert any("same size" in n for n in plan.notes)
 
 
 def test_plan_ramp_up_grows_to_the_oversample():
     # G: the passes grow evenly to x1.5 and the final resample brings the image back to its
     # exact source size.
-    plan = stepwise_plan.plan_upscale(1152, 864, 1.0, 5, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.7, 0.7, 0.01,
+    plan = stepwise_plan.plan_upscale(1152, 864, 1.0, 5, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.7, 0.7,
                                       oversample=1.5, oversample_mode="ramp up", downscale_method="bicubic (mitchell)")
     sizes = [(s.width, s.height) for s in plan.steps]
     assert all(b[0] > a[0] and b[1] > a[1] for a, b in itertools.pairwise([(1152, 864), *sizes]))
@@ -396,40 +502,45 @@ def test_plan_ramp_up_grows_to_the_oversample():
 def test_plan_oversampled_upscale(mode):
     # x2 out, oversample 1.3: the largest pass is the last at about x2.6, then one shrink onto
     # exactly round(source x 2).
-    plan = stepwise_plan.plan_upscale(1000, 750, 2.0, 5, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.7, 0.5, 0.0,
+    plan = stepwise_plan.plan_upscale(1000, 750, 2.0, 5, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.7, 0.5,
                                       oversample=1.3, oversample_mode=mode, upscale_method="bicubic (catmull-rom)")
     assert (plan.width, plan.height) == (2000, 1500)
     if mode == "constant":
         ideal = [1000 * 2.0 ** (i / 5) * 1.3 for i in range(1, 6)]
     else:
         ideal = [1000 * 2.6 ** (i / 5) for i in range(1, 6)]
-    assert [s.width for s in plan.steps] == [round(x) for x in ideal]
-    assert max(s.width for s in plan.steps) == plan.steps[-1].width == 2600
+    assert all(s.width % 16 == 0 and abs(s.width - x) <= 16 for s, x in zip(plan.steps, ideal, strict=True))
+    last = plan.steps[-1]
+    assert max(s.width for s in plan.steps) == last.width
     assert all(s.method == "bicubic (catmull-rom)" for s in plan.steps)
-    assert plan.final == stepwise_plan.FinalResample(2600, 1950, 2000, 1500, "area")
+    assert plan.final == stepwise_plan.FinalResample(last.width, last.height, 2000, 1500, "area")
     text = stepwise_plan.format_plan(plan, 12)
-    assert f"oversample x1.3 {mode}" in text and "Final: " in text and "2600x1950" in text
+    assert f"oversample x1.3 {mode}" in text and "\nFinal\n" in text and f"{last.width}x{last.height} -> 2000x1500" in text
 
 
 def test_plan_constant_oversample_is_the_enlarge_refine_shrink_loop():
-    # Per pass enlarge by U = 2 ** (1/5) * 1.3, shrink by D = 1.3, the two merged between passes.
-    plan = stepwise_plan.plan_upscale(1000, 750, 2.0, 5, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.7, 0.5, 0.0,
+    # Per pass enlarge by U = 2 ** (1/5) * 1.3, shrink by D = 1.3, the two merged between passes: the
+    # first pass jumps by U, every later one grows by U / D = 2 ** (1/5), and one shrink /1.3 ends it.
+    plan = stepwise_plan.plan_upscale(1000, 750, 2.0, 5, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.7, 0.5,
                                       oversample=1.3)
+    widths = [1000] + [s.width for s in plan.steps]
+    assert widths[1] / widths[0] == pytest.approx(2 ** 0.2 * 1.3, rel=0.02)
+    assert all(b / a == pytest.approx(2 ** 0.2, rel=0.02) for a, b in itertools.pairwise(widths[1:]))
     text = stepwise_plan.format_plan(plan)
-    assert f"enlarge x{2 ** 0.2 * 1.3:.4f}, refine, shrink /1.3" in text
+    assert f"shrink   {widths[-1]}x{plan.steps[-1].height} -> 2000x1500" in text
 
 
 def test_plan_plain_upscale_has_no_final_resample():
-    plan = stepwise_plan.plan_upscale(1280, 960, 3.0, 3, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.45, 0.22, 0.01)
+    plan = stepwise_plan.plan_upscale(1280, 960, 3.0, 3, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.45, 0.22)
     assert plan.final is None and plan.oversample == 1.0
-    assert "Final: " not in stepwise_plan.format_plan(plan)
+    assert "\nFinal\n" not in stepwise_plan.format_plan(plan)
     ramp = stepwise_plan.plan_upscale(1280, 960, 3.0, 3, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.45, 0.22,
-                                      0.01, oversample_mode="ramp up")
+                                      oversample_mode="ramp up")
     assert ramp.steps == plan.steps
 
 
 def test_plan_auto_steps_count_the_oversample():
-    plan = stepwise_plan.plan_upscale(1000, 750, 2.0, 0, EIGHT, 1024, 1024, 32, 32, 0.5, 0.5, 0.01, oversample=1.5)
+    plan = stepwise_plan.plan_upscale(1000, 750, 2.0, 0, EIGHT, 1024, 1024, 32, 32, 0.5, 0.5, oversample=1.5)
     assert len(plan.steps) == stepwise_plan.auto_step_count(3.0) == 3
 
 
@@ -439,7 +550,7 @@ def test_plan_auto_steps_count_the_oversample():
 ])
 def test_plan_rejects_bad_repair_inputs(kwargs, match):
     with pytest.raises(ValueError, match=match):
-        stepwise_plan.plan_upscale(800, 600, 2.0, 2, EIGHT, 1024, 1024, 32, 32, 0.5, 0.5, 0.01, **kwargs)
+        stepwise_plan.plan_upscale(800, 600, 2.0, 2, EIGHT, 1024, 1024, 32, 32, 0.5, 0.5, **kwargs)
 
 
 def test_widget_method_lists_match_the_resampler(comfy_stubs):
@@ -514,6 +625,26 @@ def test_resample_same_size_is_the_input():
     assert resample.resize(image, 30, 20, resample.MITCHELL) is image
 
 
+@pytest.mark.parametrize("method", ["area", "lanczos", "bicubic (mitchell)"])
+def test_resample_virtual_keeps_the_centre_of_a_fractional_resize(method):
+    from context_anchored_tile_refine import resample
+
+    image = torch.rand(1, 20, 30, 3, generator=torch.Generator().manual_seed(4))
+    # A whole-pixel virtual size is the plain resize, cropped around the centre.
+    whole = resample.resize(image, 72, 48, method)
+    window = resample.resize(image, 64, 44, method, virtual=(72.0, 48.0))
+    assert torch.allclose(window, whole[:, 2:46, 4:68], atol=1e-6)
+    # A fractional one: a flat image stays flat, and the window sits in the exact centre, so a
+    # mirror-symmetric image comes out mirror-symmetric on both axes.
+    flat = resample.resize(torch.full((1, 20, 30, 3), 0.25), 64, 44, method, virtual=(72.5, 48.3))
+    assert torch.allclose(flat, torch.full_like(flat, 0.25), atol=1e-6)
+    xs = (torch.arange(30) - 14.5).abs().view(1, 1, 30, 1)
+    ys = (torch.arange(20) - 9.5).abs().view(1, 20, 1, 1)
+    symmetric = ((xs + 2 * ys) / 40).expand(1, 20, 30, 3).contiguous()
+    out = resample.resize(symmetric, 60, 40, method, virtual=(72.5, 48.3))
+    assert torch.allclose(out, out.flip(2), atol=1e-6) and torch.allclose(out, out.flip(1), atol=1e-6)
+
+
 def test_step_noise_offsets_the_seed_per_pass():
     from context_anchored_tile_refine.stepwise_nodes import step_noise
 
@@ -547,6 +678,6 @@ def test_stepwise_node_repair_loop_end_to_end(comfy_stubs, upscale_by, oversampl
         downscale_method="bicubic (catmull-rom)")
     assert (final.shape[2], final.shape[1]) == (round(160 * upscale_by), round(120 * upscale_by))
     assert len(step_images) == 4 and step_images[-1] is final
-    assert "Final: " in text
+    assert "\nFinal\n" in text
     # Each pass draws its noise on its own seed.
     assert sorted(set(log)) == [3, 4, 5]
