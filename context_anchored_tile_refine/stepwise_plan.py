@@ -322,10 +322,12 @@ def plan_upscale(src_width, src_height, factor, steps, geometry, cap_width, cap_
     if plain and factor <= 1.0 and (canvas_w, canvas_h) != (target_w, target_h):
         # The crop's enlargement is all the run does to the size: a near-identity resample.
         ew, eh = enlarge_w or canvas_w, enlarge_h or canvas_h
+        off = [f"{name} {length}" for name, length in (("width", target_w), ("height", target_h))
+               if length % geometry.multiple]
         plan_warnings.append(
-            f"{target_w}x{target_h} is not a multiple of {geometry.multiple} px, so the image is enlarged "
-            f"{_factors(ew / src_width, eh / src_height)} and cropped back, which softens it slightly. "
-            f"\"{OUTPUT_PAD}\" keeps every pixel as it is.")
+            f"{' and '.join(off)} {'is' if len(off) == 1 else 'are'} not a multiple of {geometry.multiple} px, so the "
+            f"image is enlarged {_factors(ew / src_width, eh / src_height)} and cropped back, which softens it "
+            f"slightly. output_size \"{OUTPUT_PAD}\" avoids the resample and keeps every edge pixel.")
 
     plan_steps = []
     prev_w, prev_h = src_width, src_height
@@ -546,7 +548,7 @@ def format_plan(plan, sampler_steps=None, value_label="Denoise", shifting=None, 
         low, high = sum(w[0] for w in shifting.windows), sum(w[1] for w in shifting.windows)
         total = f"Total {_fmt_span(low, high)} window{'s' if high != 1 else ''}"
     if sampler_steps:
-        total += f" x {sampler_steps} sampler steps"
+        total += f" x {sampler_steps} sampler step{'s' if sampler_steps != 1 else ''}"
         if scheduler:
             total += f" ({scheduler})"
     lines += ["", f"Output {plan.width}x{plan.height}. {total}."]
