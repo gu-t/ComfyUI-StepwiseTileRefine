@@ -503,13 +503,16 @@ def _step_head(s, value_label, schedule, steps_mode=None):
     return head + f", {_plural(schedule.steps, 'sampler step')}"
 
 
-def _sampler_steps_line(steps_mode, steps, value_label, scheduler):
+def _sampler_steps_line(steps_mode, steps, value_label, scheduler, schedules):
     # How the run's steps setting becomes every step's sampler steps (noise_level.build_schedules).
     # The mode names are noise_level's; this module stays stdlib only, so they are spelled out.
     by = f" ({scheduler})" if scheduler else ""
     if steps_mode == "same step size":
-        return (f"Sampler steps: same step size, each step's share of one {steps}-step schedule over the whole "
-                f"noise range{by}.")
+        # The schedule the steps were cut from, which beta returns shorter when it drops repeats.
+        length = next((sc.total for sc in schedules if sc.total), steps)
+        dropped = f", {steps} asked, repeats dropped" if length != steps else ""
+        return (f"Sampler steps: same step size, each step's share of one {length}-step schedule over the whole "
+                f"noise range{by}{dropped}.")
     if steps_mode == "proportional to noise":
         return f"Sampler steps: proportional to noise, {steps} x each step's {value_label.lower()}, rounded up{by}."
     return f"Sampler steps: {steps} per step{by}."
@@ -558,7 +561,7 @@ def format_plan(plan, sampler_steps=None, value_label="Denoise", shifting=None, 
         rings = f"Ring: tile_padding {plan.context_anchor} px (tile_overlap is not used)."
     lines = ["STEPWISE TILE UPSCALE PLAN", head]
     if schedules and steps_mode and sampler_steps:
-        lines.append(_sampler_steps_line(steps_mode, sampler_steps, value_label, scheduler))
+        lines.append(_sampler_steps_line(steps_mode, sampler_steps, value_label, scheduler, schedules))
     lines += [tiles, f"{rings} {grid_text}"]
     for i, s in enumerate(plan.steps):
         schedule = schedules[i] if schedules else None

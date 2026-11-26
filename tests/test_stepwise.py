@@ -557,6 +557,23 @@ def test_step_head_marks_a_fractional_same_step_size_denoise_as_about(steps_mode
     assert _step_head(step, "Denoise", denoise, steps_mode).endswith("(= noise level 0.400), 2 sampler steps")
 
 
+def test_same_step_size_plan_names_the_schedule_length_returned():
+    # beta drops repeated sigmas at many steps; the header names the schedule the steps were cut from.
+    from context_anchored_tile_refine.noise_level import Schedule
+
+    plan = stepwise_plan.plan_upscale(160, 120, 2.0, 2, LatentGeometry(16, 16), 256, 256, 32, 32, 0.5, 0.25)
+    def schedule(total):
+        return Schedule("noise level", 0.5, torch.tensor([0.5, 0.2, 0.0]), total, 0.5, 0.5, 0.01)
+
+    text = stepwise_plan.format_plan(plan, 200, "Noise level", schedules=[schedule(199)] * 2, scheduler="beta",
+                                     steps_mode="same step size")
+    assert ("Sampler steps: same step size, each step's share of one 199-step schedule over the whole noise range "
+            "(beta), 200 asked, repeats dropped.") in text
+    text = stepwise_plan.format_plan(plan, 200, "Noise level", schedules=[schedule(200)] * 2, scheduler="beta",
+                                     steps_mode="same step size")
+    assert "one 200-step schedule over the whole noise range (beta)." in text
+
+
 def test_auto_tile_cap_by_family():
     def guider_for(name):
         config = type(name, (), {})()
