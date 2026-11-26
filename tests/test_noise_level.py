@@ -304,6 +304,18 @@ def test_same_step_size_on_a_schedule_sigma_adds_no_step(flow_sigmas):
     assert s.denoise == pytest.approx(3 / 25)
 
 
+@pytest.mark.parametrize("steps", [20, 25, 50, 77])
+def test_same_step_size_on_a_schedule_sigma_is_exactly_basic_scheduler(flow_sigmas, steps):
+    # An unscaled tail is BasicScheduler with its steps and denoise, and the plan says "=". The
+    # denoise must not land a hair above k / steps (it did for 41 of 50 steps: int(41 / 0.82..01)
+    # is 49, another length).
+    full = flow_simple(steps)
+    for j in range(1, steps):
+        (s,) = build_schedules(_patcher(True), "simple", steps, [float(full[j])], NOISE_LEVEL, SAME_STEP_SIZE)
+        assert s.steps == steps - j and torch.equal(s.sigmas, full[j:])
+        assert int(s.steps / s.denoise) == steps and s.exact, j
+
+
 @pytest.mark.parametrize("value, steps", [(0.3, 8), (0.2, 5), (0.24, 6), (1.0, 25), (0.001, 1)])
 def test_same_step_size_denoise_takes_the_last_steps_rounded_up(flow_sigmas, value, steps):
     (s,) = build_schedules(_patcher(True), "simple", 25, [value], DENOISE, SAME_STEP_SIZE)
@@ -346,14 +358,31 @@ def test_same_step_size_above_the_top_is_the_whole_schedule(comfy_stubs, monkeyp
     assert torch.equal(s.sigmas, sigmas) and s.steps == 4
 
 
-@pytest.mark.parametrize("mode, value, steps, share", [(NOISE_LEVEL, 0.3, 2, 1.5 / 4), (DENOISE, 0.5, 2, 2 / 4)])
-def test_same_step_size_counts_the_share_on_the_schedule_returned(comfy_stubs, monkeypatch, mode, value, steps, share):
-    # beta drops repeated sigmas at many steps: 6 asked, 4 returned. The share is of those 4.
+@pytest.mark.parametrize("mode, value, steps, denoise", [(NOISE_LEVEL, 0.3, 2, 1.5 / 6), (DENOISE, 0.5, 2, 2 / 6)])
+def test_same_step_size_counts_the_steps_on_the_schedule_returned(comfy_stubs, monkeypatch, mode, value, steps,
+                                                                  denoise):
+    # beta drops repeated sigmas at many steps: 6 asked, 4 returned. The steps are counted on those
+    # 4; the denoise is BasicScheduler's, which asks for 6 again.
     sigmas = torch.tensor([1.0, 0.6, 0.4, 0.2, 0.0])
     monkeypatch.setattr(sys.modules["comfy.samplers"], "calculate_sigmas", lambda ms, name, n: sigmas)
     (s,) = build_schedules(_patcher(True), "beta", 6, [value], mode, SAME_STEP_SIZE)
-    assert s.steps == steps and s.total == 4 and s.denoise == pytest.approx(share)
+    assert s.steps == steps and s.total == 4 and s.denoise == pytest.approx(denoise)
     assert s.start_sigma == pytest.approx(0.3 if mode == NOISE_LEVEL else 0.4)
+
+
+def test_same_step_size_denoise_for_a_scheduler_that_returns_more(comfy_stubs, monkeypatch):
+    # ddim_uniform returns 63 steps for 60. A tail of it is BasicScheduler with denoise k / 60,
+    # which asks for 60 again, not k / 63. The whole schedule has more steps than 60, so its
+    # denoise is 1 and BasicScheduler asks for 63, which is exact only where 63 gives the same.
+    def calc(ms, name, n):
+        return flow_simple(63) if n == 60 else flow_simple(n)
+
+    monkeypatch.setattr(sys.modules["comfy.samplers"], "calculate_sigmas", calc)
+    full = flow_simple(63)
+    (s,) = build_schedules(_patcher(True), "ddim_uniform", 60, [float(full[51])], NOISE_LEVEL, SAME_STEP_SIZE)
+    assert s.total == 63 and s.steps == 12 and s.exact and s.denoise == pytest.approx(12 / 60)
+    (s,) = build_schedules(_patcher(True), "ddim_uniform", 60, [1.0], NOISE_LEVEL, SAME_STEP_SIZE)
+    assert s.steps == 63 and s.denoise == 1.0 and s.exact  # this stub's 63 is the same schedule
 
 
 @pytest.mark.comfy
@@ -370,7 +399,7 @@ def test_same_step_size_on_real_beta_with_dropped_sigmas(comfy_env):
     assert full.numel() < 501  # the case this test is about
     (s,) = build_schedules(patcher, "beta", 500, [0.01], NOISE_LEVEL, SAME_STEP_SIZE)
     assert s.total == full.numel() - 1
-    assert (s.steps - 1) / s.total < s.denoise <= s.steps / s.total + 1e-9
+    assert (s.steps - 1) / 500 < s.denoise <= s.steps / 500 + 1e-9  # BasicScheduler asks for 500 again
 
 
 @pytest.mark.comfy
@@ -415,6 +444,38 @@ def test_real_denoise_shown_is_the_basic_scheduler_one(comfy_env, scheduler):
             assert s.exact == torch.equal(basic, s.sigmas), (steps, level)
             if s.steps == steps:  # every step asked: BasicScheduler gives the same pass
                 assert s.exact and float(basic[0]) == s.start_sigma, (steps, level)
+
+
+@pytest.mark.comfy
+@pytest.mark.parametrize("flow", [True, False])
+@pytest.mark.parametrize("scheduler", ["simple", "ddim_uniform", "beta", "karras"])
+def test_real_same_step_size_denoise_shown_is_the_basic_scheduler_one(comfy_env, scheduler, flow):
+    # A same step size pass in noise level mode shows "=" exactly when BasicScheduler with its steps
+    # and denoise gives its sigmas. ddim_uniform returns more steps than asked (63 for 60), beta
+    # fewer; a level on a sigma of the schedule takes an unscaled tail, every one of them exact (on
+    # an eps model too, whose level -> sigma round trip misses the sigma by float error).
+    import comfy.model_sampling
+    import comfy.samplers
+
+    class FlowShift5(comfy.model_sampling.ModelSamplingDiscreteFlow, comfy.model_sampling.CONST):
+        pass
+
+    class Eps(comfy.model_sampling.ModelSamplingDiscrete, comfy.model_sampling.EPS):
+        pass
+
+    ms = FlowShift5(SimpleNamespace(sampling_settings={"shift": 5.0, "multiplier": 1000})) if flow else Eps(None)
+    patcher = SimpleNamespace(get_model_object=lambda name: ms)
+    for steps in (25, 50, 60):
+        full = noise_level.drop_repeats(comfy.samplers.calculate_sigmas(ms, scheduler, steps))
+        levels = [noise_level.sigma_to_level(float(full[j]), flow) for j in range(1, full.numel() - 1)]
+        levels += [0.05, 0.2, 0.33, 0.6]
+        for level, s in zip(levels, build_schedules(patcher, scheduler, steps, levels, NOISE_LEVEL, SAME_STEP_SIZE),
+                            strict=True):
+            asks = int(s.steps / s.denoise) if s.denoise < 1.0 else s.steps
+            basic = comfy.samplers.calculate_sigmas(ms, scheduler, asks)[-(s.steps + 1):]
+            assert s.exact == torch.equal(basic, s.sigmas), (steps, level)
+            if level in levels[:full.numel() - 2] and s.steps <= steps:
+                assert s.exact, (steps, level)
 
 
 def test_build_schedules_rejects_unknown_steps_mode(comfy_stubs):

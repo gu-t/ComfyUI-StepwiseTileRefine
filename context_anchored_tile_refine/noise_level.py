@@ -131,10 +131,11 @@ class Schedule:
     total: int            # length of the schedule the sigmas were cut from, 0 when empty
     start_sigma: float
     start_level: float
-    # The BasicScheduler denoise of these sigmas: steps / total, total the length BasicScheduler
-    # asks the scheduler for. A pass with fewer steps than asked and build_schedules' same step
-    # size passes give their share of the schedule they were cut from instead, which a denoise
-    # setting may not reproduce; `exact` says whether it does.
+    # The BasicScheduler denoise of these sigmas: steps / the length BasicScheduler asks the
+    # scheduler for (total in build_schedule, the `steps` setting for build_schedules' same step
+    # size passes). A pass with fewer steps than asked gives its share of the schedule it was cut
+    # from instead, and a same step size tail scaled to its level a fractional count, which no
+    # denoise setting reproduces; `exact` says whether this one does.
     denoise: float
     # The steps asked for (build_schedule); more than `steps` when the scheduler has too few
     # distinct sigmas. 0 where the count is a share of one schedule (same step size).
@@ -161,6 +162,15 @@ def drop_repeats(sigmas):
     import torch
 
     return torch.unique_consecutive(sigmas) if sigmas.numel() > 1 else sigmas
+
+
+def basic_denoise(steps, n):
+    """The denoise with which BasicScheduler, given `steps`, asks the scheduler for length n:
+    steps / n, nudged down a hair where float would make int(steps / denoise) land below n."""
+    denoise = steps / n
+    if int(steps / denoise) < n:
+        denoise = math.nextafter(denoise, 0.0)
+    return denoise
 
 
 def is_basic(raw, sigmas, denoise):
@@ -261,9 +271,7 @@ def build_schedule(model_patcher, scheduler, steps, value, mode=NOISE_LEVEL):
             # BasicScheduler's denoise for length n. Its own count of what the scheduler returns
             # does not matter: beta and ddim_uniform return fewer than n (232 for 233, say), and
             # steps / 232 would make BasicScheduler ask for 232 and start elsewhere.
-            total, denoise = n, steps / n
-            if int(steps / denoise) < n:  # float: steps / (steps / n) can land a hair below n
-                denoise = math.nextafter(denoise, 0.0)
+            total, denoise = n, basic_denoise(steps, n)
         else:
             # The share of the schedule the fewer steps were cut from, repeats dropped; no
             # denoise setting gives these sigmas, since BasicScheduler keeps `steps` of them.
@@ -295,10 +303,11 @@ def build_schedules(model_patcher, scheduler, steps, values, mode=NOISE_LEVEL, s
     none is longer than the schedule's. A level on a schedule sigma keeps the tail as it is.
     DENOISE: the last ceil(steps * denoise) steps, as they are.
 
-    Repeated sigmas are dropped (beta drops them itself, simple and ddim_uniform repeat when asked
-    for more than the model's 1000 timesteps), so the share is counted on the schedule without
-    them, not on `steps`. Either way a pass gets at least 1 step, and a value of 0 samples
-    nothing."""
+    The steps are counted on the schedule the scheduler returns for `steps`, repeated sigmas
+    dropped: beta drops them itself, simple and ddim_uniform repeat when asked for more than the
+    model's 1000 timesteps, and ddim_uniform can also return more than asked (63 for 60). The
+    denoise is BasicScheduler's, which asks for `steps` again: the pass's steps over `steps`, at
+    most 1. Either way a pass gets at least 1 step, and a value of 0 samples nothing."""
     import torch
 
     if steps_mode not in STEPS_MODES:
@@ -327,35 +336,39 @@ def build_schedules(model_patcher, scheduler, steps, values, mode=NOISE_LEVEL, s
         if v <= 0.0:
             schedules.append(Schedule(mode, v, torch.FloatTensor([]), 0, 0.0, 0.0, 0.0))
             continue
+        scaled = None  # the fractional step count of a tail scaled down to start at the level
         if mode == DENOISE:
             n = min(total, max(1, math.ceil(total * v - 1e-9)))
             sigmas = full[-(n + 1):]
-            share = n / total
         else:
             target = level_to_sigma(v, flow)
             # Sigmas fall along the schedule, so those at or above the target are a prefix of it.
-            # The tolerance keeps a level that is a schedule sigma up to float error from adding a
-            # step.
+            # The tolerance keeps a level that is a schedule sigma up to float error (an eps model's
+            # level -> sigma round trip, say) from adding a step or scaling the tail by 1 - 1e-7.
             above = int((full[:total] >= target * (1.0 - 1e-6)).sum())
             if above == 0:  # above the schedule's top: the whole schedule
-                sigmas, share = full, 1.0
+                sigmas = full
             else:
                 j = above - 1
                 top, below = float(full[j]), float(full[j + 1])
                 sigmas = full[j:]
-                share = (total - j - 1) / total
-                if top > target:
+                if top > target * (1.0 + 1e-6):
                     sigmas = sigmas * (target / top)
-                    share += (target - below) / (top - below) / total
-                else:
-                    share += 1.0 / total
+                    scaled = total - j - 1 + (target - below) / (top - below)
         first = float(sigmas[0])
-        # share: the part of the full schedule the pass covers. In DENOISE mode it is the denoise
-        # itself (rounded to whole steps); in NOISE_LEVEL mode it is fractional (2.4 / 25 in the
-        # example above), so it only approximates a denoise setting, which samples whole steps.
-        # A scaled tail is never BasicScheduler's; one that is not may be, and is_basic checks.
-        exact = mode == DENOISE or is_basic(raw, sigmas, share)
-        schedules.append(Schedule(mode, v, sigmas, total, first, sigma_to_level(first, flow), share, exact=exact))
+        k = sigmas.numel() - 1
+        if scaled is None:
+            # Whole steps of the schedule as it is: BasicScheduler with k steps and this denoise
+            # asks for `steps` and keeps these, unless that schedule repeats sigmas here or has more
+            # than `steps` (is_basic checks; always taken as exact in DENOISE mode, where the plan
+            # shows the noise level).
+            denoise = min(1.0, basic_denoise(k, steps))
+            exact = mode == DENOISE or is_basic(raw, sigmas, denoise)
+        else:
+            # Fractional (2.4 steps in the example above), so it only approximates a denoise
+            # setting, which samples whole steps of the scheduler's own sigmas.
+            denoise, exact = min(1.0, scaled / steps), False
+        schedules.append(Schedule(mode, v, sigmas, total, first, sigma_to_level(first, flow), denoise, exact=exact))
     return schedules
 
 

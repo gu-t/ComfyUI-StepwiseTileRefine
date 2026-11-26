@@ -520,12 +520,18 @@ def _sampler_steps_line(steps_mode, steps, value_label, scheduler, schedules):
     # The mode names are noise_level's; this module stays stdlib only, so they are spelled out.
     by = f" ({scheduler})" if scheduler else ""
     if steps_mode == "same step size":
-        # The schedule the steps were cut from, shorter without its repeated sigmas (beta drops them
-        # itself; simple and ddim_uniform repeat past the model's 1000 timesteps).
+        # The schedule the steps were cut from: shorter without its repeated sigmas (beta drops them
+        # itself; simple and ddim_uniform repeat past the model's 1000 timesteps), or longer where
+        # the scheduler returns more than asked (ddim_uniform: 63 for 60).
         length = next((sc.total for sc in schedules if sc.total), steps)
-        dropped = f", {steps} asked, repeated sigmas dropped" if length != steps else ""
+        if length < steps:
+            why = f", {steps} asked, repeated sigmas dropped"
+        elif length > steps:
+            why = f", {steps} asked, the scheduler returns more"
+        else:
+            why = ""
         return (f"Sampler steps: same step size, each step's share of one {length}-step schedule over the whole "
-                f"noise range{by}{dropped}.")
+                f"noise range{by}{why}.")
     if steps_mode == "proportional to noise":
         return f"Sampler steps: proportional to noise, {steps} x each step's {value_label.lower()}, rounded up{by}."
     return f"Sampler steps: {steps} per step{by}."

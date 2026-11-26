@@ -599,6 +599,11 @@ def test_same_step_size_plan_names_the_schedule_length_returned():
     text = stepwise_plan.format_plan(plan, 200, "Noise level", schedules=[schedule(200)] * 2, scheduler="beta",
                                      steps_mode="same step size")
     assert "one 200-step schedule over the whole noise range (beta)." in text
+    # ddim_uniform returns more than asked (63 for 60): nothing was dropped.
+    text = stepwise_plan.format_plan(plan, 60, "Noise level", schedules=[schedule(63)] * 2, scheduler="ddim_uniform",
+                                     steps_mode="same step size")
+    assert ("Sampler steps: same step size, each step's share of one 63-step schedule over the whole noise range "
+            "(ddim_uniform), 60 asked, the scheduler returns more.") in text
 
 
 def test_auto_tile_cap_by_family():
