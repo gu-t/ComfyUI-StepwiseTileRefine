@@ -1,4 +1,5 @@
 """The noise level denoise mode (noise_level.py) and its use in the Stepwise node."""
+import math
 import sys
 from types import SimpleNamespace
 
@@ -50,6 +51,30 @@ def test_solve_total_clamps_to_the_ends():
     assert solve_total(start, 10, 5.0, 10_000) == 10       # above the full schedule: denoise 1
     assert solve_total(start, 10, 1e-6, 10_000) == 10_000  # below the longest: the longest
     assert solve_total(start, 10, 0.1, 10_000) == 100
+
+
+def _bisect_total(start, steps, target, max_total):
+    # The plain bisection over every length that solve_total replaced: the reference answer.
+    if start(steps) <= target:
+        return steps
+    lo, hi = steps, max_total
+    if start(hi) > target:
+        return hi
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        lo, hi = (mid, hi) if start(mid) > target else (lo, mid)
+    return lo if abs(start(lo) - target) < abs(start(hi) - target) else hi
+
+
+@pytest.mark.parametrize("guess", [None, lambda n: 977, lambda n: 30, lambda n: 1e9, lambda n: float("inf"),
+                                   lambda n: n, lambda n: -3])
+@pytest.mark.parametrize("target", [5.0, 0.5, 0.1013, 0.01, 0.003, 1e-6])
+def test_solve_total_any_guess_gives_the_bisection_answer(guess, target):
+    # The guess only steers where the search looks: right, wrong or useless, the length is the same.
+    def start(n):
+        return math.inf if n < 14 else (10.0 / (3 * (n // 3))) ** 1.3  # plateaus, too short below 14
+
+    assert solve_total(start, 10, target, 10_000, guess) == _bisect_total(start, 10, target, 10_000)
 
 
 def _patcher(flow):
@@ -183,6 +208,42 @@ def test_real_core_schedulers_start_at_the_level(comfy_env, scheduler, level):
     # (< 0.001) from the very nearest; that is far below anything visible.
     assert abs(s.start_sigma - level) <= min(abs(start(n) - level) for n in (s.total - 1, s.total + 1) if n >= 25) + 1e-3
     assert all(float(a) >= float(b) for a, b in zip(s.sigmas[:-1], s.sigmas[1:], strict=True))
+
+
+@pytest.mark.comfy
+@pytest.mark.parametrize("scheduler", ["normal", "sgm_uniform"])
+def test_real_python_loop_schedulers_build_only_lengths_near_the_answer(comfy_env, monkeypatch, scheduler):
+    # normal and sgm_uniform build their sigmas in a Python loop (about 20 us a sigma), so the
+    # 200 000 long schedule a bisection from the top starts with took seconds a pass. The search
+    # stays near the answer and gives the same sigmas as the bisection over every length.
+    import comfy.model_sampling
+    import comfy.samplers
+
+    class FlowShift5(comfy.model_sampling.ModelSamplingDiscreteFlow, comfy.model_sampling.CONST):
+        pass
+
+    ms = FlowShift5(SimpleNamespace(sampling_settings={"shift": 5.0, "multiplier": 1000}))
+    patcher = SimpleNamespace(get_model_object=lambda name: ms)
+    real, built = comfy.samplers.calculate_sigmas, []
+
+    def calc(m, name, n):
+        built.append(n)
+        return real(m, name, n)
+
+    monkeypatch.setattr(comfy.samplers, "calculate_sigmas", calc)
+    s = build_schedule(patcher, scheduler, 200, 0.2, NOISE_LEVEL)
+    assert max(built) <= s.total + 5 and len(built) <= 8
+
+    cache = {}
+
+    def start(n):
+        if n not in cache:
+            cache[n] = float(real(ms, scheduler, n)[-201])
+        return cache[n]
+
+    # The reference bisection, over lengths up to 4x the answer only, to keep the test fast.
+    ref = _bisect_total(start, 200, 0.2, 4 * s.total)
+    assert s.total == ref and torch.equal(s.sigmas, real(ms, scheduler, ref)[-201:])
 
 
 # --- build_schedules: steps_mode ----------------------------------------------------------------

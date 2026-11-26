@@ -29,6 +29,8 @@ STEPS_MODES = (SAME_STEP_SIZE, PROPORTIONAL, STEPS_PER_PASS)
 
 # Longest schedule the search tries, as a multiple of the sampler steps (denoise 0.001).
 MAX_TOTAL_FACTOR = 1000
+# Most guesses solve_total refines before it brackets the answer by galloping.
+GUESS_ROUNDS = 4
 
 
 def level_to_sigma(level, flow):
@@ -43,18 +45,70 @@ def sigma_to_level(sigma, flow):
     return float(sigma) / (1.0 + float(sigma))
 
 
-def solve_total(start_sigma, steps, target, max_total):
+def solve_total(start_sigma, steps, target, max_total, guess=None):
     """The schedule length whose first kept sigma is closest to `target`.
 
     start_sigma(total) is the first of the last steps + 1 sigmas of a `total` step schedule,
     non-increasing in total for every core scheduler. Lengths run from `steps` (the full
     schedule, denoise 1) to `max_total`; a target above the full schedule's start gives the
-    full schedule, one below the longest schedule's start gives the longest."""
+    full schedule, one below the longest schedule's start gives the longest.
+
+    The answer is the one length lo with start(lo) > target >= start(lo + 1) (or lo + 1), so any
+    search that brackets it finds the same one. A schedule costs its length to build (normal and
+    sgm_uniform loop in Python, about 20 us a sigma), so the search stays near the answer instead
+    of bisecting down from max_total: guess(n), when given, estimates the answer from the length
+    n schedule; the search gallops from the last guess to bracket the answer and bisects inside.
+    Only when the guesses are far off (more than twice the last one) does it try max_total."""
     if start_sigma(steps) <= target:
         return steps
-    lo, hi = steps, max(steps, int(max_total))
-    if start_sigma(hi) > target:
-        return hi
+    top = max(steps, int(max_total))
+    lo, hi = steps, None  # start(lo) > target; start(hi) <= target once one is found
+    n = steps
+    for _ in range(GUESS_ROUNDS):
+        g = guess(n) if guess is not None else None
+        if g is None or not math.isfinite(g):
+            break
+        g = min(top if hi is None else hi - 1, max(lo + 1, round(g)))  # inside the open bracket
+        if g == n or (hi is not None and hi - lo <= 1):
+            break
+        n = g
+        if start_sigma(n) > target:
+            lo = n
+        else:
+            hi = n
+    step = 1
+    if hi is None:  # gallop up from lo (the last guess, or steps)
+        far = 2 * lo
+        while hi is None:
+            m = lo + step
+            if m >= top or m > far:
+                if start_sigma(top) > target:
+                    return top
+                hi = top
+            elif start_sigma(m) > target:
+                # x4: a scheduler with too few distinct sigmas gets to max_total in few probes
+                lo, step = m, step * 4
+            else:
+                hi = m
+    elif n == hi:  # the last guess is at or below the target: gallop down from it
+        while hi - lo > 1:
+            m = hi - step
+            if m <= lo:
+                break
+            if start_sigma(m) > target:
+                lo = m
+                break
+            hi, step = m, step * 2
+    else:  # the last guess is above the target: gallop up from it toward hi
+        while hi - lo > 1:
+            m = lo + step
+            if m >= hi:
+                break
+            if start_sigma(m) > target:
+                lo, step = m, step * 2
+            else:
+                hi = m
+                break
     while hi - lo > 1:  # start(lo) > target >= start(hi)
         mid = (lo + hi) // 2
         if start_sigma(mid) > target:
@@ -143,15 +197,33 @@ def build_schedule(model_patcher, scheduler, steps, value, mode=NOISE_LEVEL):
             f = full(n)
             return float(f[-(steps + 1)]) if f.numel() > steps else math.inf
 
+        def guess(n):
+            # The length whose start lands on the target if the length n schedule kept its shape
+            # when stretched: the target sits at share p of its steps, and a length m schedule
+            # starts at share (m - steps) / m, so m = steps / (1 - p).
+            f = full(n)
+            k = f.numel() - 1
+            j = int((f[:-1] > target).sum())  # f[:j] are above the target
+            if j == 0 or k < 1:
+                return None
+            if j >= k:  # below the last sigma before 0: call it halfway to 0
+                p = (k - 0.5) / k
+            else:
+                above, below = float(f[j - 1]), float(f[j])
+                p = (j - 1 + (above - target) / (above - below)) / k
+            return steps / (1.0 - p)
+
         target = level_to_sigma(value, flow)
         longest = steps * MAX_TOTAL_FACTOR
-        n = solve_total(start, steps, target, longest)
+        n = solve_total(start, steps, target, longest, guess)
         sigmas, length = full(n)[-(steps + 1):], full(n)
-        if float(sigmas[0]) > target:
+        if float(sigmas[0]) > target and n == longest:
             # No length has `steps` distinct sigmas from the level down, so the start lands above
             # it. The longest schedule's tail from the sigma nearest the level has fewer steps and
-            # starts where asked; it wins when it starts nearer (a dense scheduler's longest
-            # schedule has far more than `steps` below any level and is never taken).
+            # starts where asked; it wins when it starts nearer. Below the longest (n < longest)
+            # length n + 1 has steps + 1 distinct sigmas at or below the level, and no core
+            # scheduler has fewer of them at a greater length, so the longest schedule's tail has
+            # at least `steps` steps and is never taken: it is not built.
             f = full(longest)
             j = int((f[:-1] >= target).sum())  # f[:j] are at or above the target
             # The nearer of f[j - 1] and f[j], never the final 0.
