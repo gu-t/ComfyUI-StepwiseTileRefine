@@ -73,7 +73,10 @@ class Schedule:
     total: int            # length of the schedule the sigmas were cut from, 0 when empty
     start_sigma: float
     start_level: float
-    denoise: float        # the BasicScheduler denoise that gives the same sigmas (steps / total)
+    # The BasicScheduler denoise that gives the same sigmas (steps / total). build_schedules'
+    # same-step-size passes give their share of the full schedule instead, fractional in noise
+    # level mode, which no denoise setting reproduces exactly.
+    denoise: float
 
     @property
     def steps(self):
@@ -136,13 +139,17 @@ def build_schedules(model_patcher, scheduler, steps, values, mode=NOISE_LEVEL, s
     NOISE_LEVEL mode) and keeps the scheduler's own shape within the pass.
 
     SAME_STEP_SIZE: `steps` are the steps of a full generation (denoise 1), and every pass samples
-    the tail of that one schedule below its own start, so all passes share its spacing, a pass with
-    less noise takes fewer steps, and no pass depends on the others' values. NOISE_LEVEL: the tail
-    starts at the last sigma at or above the level and is scaled down to start exactly at it, so a
-    level between two sigmas (2.4 steps of the schedule, say) gets the count rounded up (3) and no
-    step is longer than the schedule's. DENOISE: the last ceil(steps * denoise) steps, as they are.
+    the tail of that one schedule below its own start, so a pass with less noise takes fewer steps
+    and no pass depends on the others' values. NOISE_LEVEL: the tail starts at the last sigma at or
+    above the level and the whole tail is scaled down to start exactly at it, so a level between
+    two sigmas (2.4 steps of the schedule, say) gets the count rounded up (3), every step of the
+    tail shrinks by the same factor (down to the next sigma below over the one above, at most) and
+    none is longer than the schedule's. A level on a schedule sigma keeps the tail as it is.
+    DENOISE: the last ceil(steps * denoise) steps, as they are.
 
-    Either way a pass gets at least 1 step, and a value of 0 samples nothing."""
+    A scheduler may drop repeated sigmas (beta does at many steps), so the share is counted on the
+    schedule it returns, not on `steps`. Either way a pass gets at least 1 step, and a value of 0
+    samples nothing."""
     import torch
 
     if steps_mode not in STEPS_MODES:
@@ -160,8 +167,8 @@ def build_schedules(model_patcher, scheduler, steps, values, mode=NOISE_LEVEL, s
 
     model_sampling = model_patcher.get_model_object("model_sampling")
     flow = is_flow(model_sampling)
-    total = int(steps)
-    full = comfy.samplers.calculate_sigmas(model_sampling, scheduler, total).cpu()
+    full = comfy.samplers.calculate_sigmas(model_sampling, scheduler, int(steps)).cpu()
+    total = full.numel() - 1  # the steps the scheduler returned, fewer than asked if it dropped repeats
     schedules = []
     for v in values:
         if v <= 0.0:
@@ -190,8 +197,9 @@ def build_schedules(model_patcher, scheduler, steps, values, mode=NOISE_LEVEL, s
                 else:
                     share += 1.0 / total
         first = float(sigmas[0])
-        # share: the part of the full schedule the pass covers, the BasicScheduler denoise of its
-        # start (in NOISE_LEVEL mode fractional, 2.4 / 25 in the example above).
+        # share: the part of the full schedule the pass covers. In DENOISE mode it is the denoise
+        # itself (rounded to whole steps); in NOISE_LEVEL mode it is fractional (2.4 / 25 in the
+        # example above), so it only approximates a denoise setting, which samples whole steps.
         schedules.append(Schedule(mode, v, sigmas, total, first, sigma_to_level(first, flow), share))
     return schedules
 

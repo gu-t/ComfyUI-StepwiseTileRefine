@@ -541,6 +541,22 @@ def test_stepwise_steps_mode_drives_the_sigmas_and_the_plan(comfy_stubs, monkeyp
     assert f", {total} tile steps (tiles x sampler steps)." in text
 
 
+@pytest.mark.parametrize("steps_mode, sign", [("same step size", "~"), ("proportional to noise", "="),
+                                              ("steps per pass", "=")])
+def test_step_head_marks_a_fractional_same_step_size_denoise_as_about(steps_mode, sign):
+    # A same step size pass in noise level mode covers a fractional share of the full schedule,
+    # which no denoise setting reproduces; the other modes' denoise is a BasicScheduler value.
+    from context_anchored_tile_refine.noise_level import Schedule
+    from context_anchored_tile_refine.stepwise_plan import _step_head
+
+    step = SimpleNamespace(index=1, denoise=0.31)
+    schedule = Schedule("noise level", 0.31, torch.tensor([0.31, 0.2, 0.0]), 25, 0.31, 0.31, 0.0912)
+    assert _step_head(step, "Noise level", schedule, steps_mode) == \
+        f"Step 1, noise level 0.310 ({sign} denoise 0.091), 2 sampler steps"
+    denoise = Schedule("denoise", 0.1, torch.tensor([0.4, 0.2, 0.0]), 25, 0.4, 0.4, 0.08)
+    assert _step_head(step, "Denoise", denoise, steps_mode).endswith("(= noise level 0.400), 2 sampler steps")
+
+
 def test_auto_tile_cap_by_family():
     def guider_for(name):
         config = type(name, (), {})()

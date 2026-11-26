@@ -239,6 +239,33 @@ def test_same_step_size_above_the_top_is_the_whole_schedule(comfy_stubs, monkeyp
     assert torch.equal(s.sigmas, sigmas) and s.steps == 4
 
 
+@pytest.mark.parametrize("mode, value, steps, share", [(NOISE_LEVEL, 0.3, 2, 1.5 / 4), (DENOISE, 0.5, 2, 2 / 4)])
+def test_same_step_size_counts_the_share_on_the_schedule_returned(comfy_stubs, monkeypatch, mode, value, steps, share):
+    # beta drops repeated sigmas at many steps: 6 asked, 4 returned. The share is of those 4.
+    sigmas = torch.tensor([1.0, 0.6, 0.4, 0.2, 0.0])
+    monkeypatch.setattr(sys.modules["comfy.samplers"], "calculate_sigmas", lambda ms, name, n: sigmas)
+    (s,) = build_schedules(_patcher(True), "beta", 6, [value], mode, SAME_STEP_SIZE)
+    assert s.steps == steps and s.total == 4 and s.denoise == pytest.approx(share)
+    assert s.start_sigma == pytest.approx(0.3 if mode == NOISE_LEVEL else 0.4)
+
+
+@pytest.mark.comfy
+def test_same_step_size_on_real_beta_with_dropped_sigmas(comfy_env):
+    import comfy.model_sampling
+    import comfy.samplers
+
+    class FlowShift5(comfy.model_sampling.ModelSamplingDiscreteFlow, comfy.model_sampling.CONST):
+        pass
+
+    ms = FlowShift5(SimpleNamespace(sampling_settings={"shift": 5.0, "multiplier": 1000}))
+    patcher = SimpleNamespace(get_model_object=lambda name: ms)
+    full = comfy.samplers.calculate_sigmas(ms, "beta", 500)
+    assert full.numel() < 501  # the case this test is about
+    (s,) = build_schedules(patcher, "beta", 500, [0.01], NOISE_LEVEL, SAME_STEP_SIZE)
+    assert s.total == full.numel() - 1
+    assert (s.steps - 1) / s.total < s.denoise <= s.steps / s.total + 1e-9
+
+
 def test_build_schedules_rejects_unknown_steps_mode(comfy_stubs):
     with pytest.raises(ValueError, match="steps_mode"):
         build_schedules(_patcher(True), "simple", 25, [0.3], NOISE_LEVEL, "fast")
