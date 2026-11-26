@@ -485,21 +485,22 @@ def _plural(n, word):
     return f"{n} {word}{'s' if n != 1 else ''}"
 
 
-def _step_head(s, value_label, schedule, steps_mode=None, scheduler=None):
+def _step_head(s, value_label, schedule, scheduler=None):
     # "Step 1, noise level 0.450 (= denoise 0.140), 25 sampler steps": the setting, what it equals
-    # in the other denoise mode and the steps it samples, when the run's schedule is known. A same
-    # step size pass's denoise is a fractional share of the full schedule (noise_level.build_schedules),
-    # which no denoise setting gives exactly, so it is only "about". A start that misses the level
-    # by 0.01 or more is named, as a guard. Fewer steps than asked (noise_level.build_schedule
-    # never repeats a sigma) are named with the reason: in noise level mode the scheduler has no
-    # more distinct sigmas below the level, in denoise mode BasicScheduler's schedule repeated some.
+    # in the other denoise mode and the steps it samples, when the run's schedule is known. The
+    # denoise is "=" only where BasicScheduler with it gives exactly these sigmas (Schedule.exact),
+    # "~" otherwise: a same step size pass's fractional share, or a pass with fewer steps than
+    # asked. A start that misses the level by 0.01 or more is named, as a guard. Fewer steps than
+    # asked (noise_level.build_schedule never repeats a sigma) are named with the reason: in noise
+    # level mode the scheduler has no more distinct sigmas below the level, in denoise mode
+    # BasicScheduler's schedule repeated some.
     head = f"Step {s.index}, {value_label.lower()} {s.denoise:.3f}"
     if schedule is None:
         return head
     if schedule.total == 0:
         return head + ", no sampling"
     if value_label.lower() == "noise level":
-        sign = "~" if steps_mode == "same step size" else "="
+        sign = "=" if schedule.exact else "~"
         start = f"starts at {schedule.start_level:.3f}, " if abs(schedule.start_level - s.denoise) >= 0.01 else ""
         head += f" ({start}{sign} denoise {schedule.denoise:.3f})"
     else:
@@ -577,7 +578,7 @@ def format_plan(plan, sampler_steps=None, value_label="Denoise", shifting=None, 
     lines += [tiles, f"{rings} {grid_text}"]
     for i, s in enumerate(plan.steps):
         schedule = schedules[i] if schedules else None
-        lines += ["", _step_head(s, value_label, schedule, steps_mode, scheduler), *_step_ops(plan, s, shifting)]
+        lines += ["", _step_head(s, value_label, schedule, scheduler), *_step_ops(plan, s, shifting)]
     f = plan.final
     if isinstance(f, FinalResample):
         verb = "shrink" if f.width <= f.src_width and f.height <= f.src_height else "resize"

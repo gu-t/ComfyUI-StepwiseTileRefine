@@ -393,6 +393,30 @@ def test_real_beta_at_many_steps_does_not_crash(comfy_env, steps_mode, steps):
         assert 0.0 < s.denoise <= 1.0
 
 
+@pytest.mark.comfy
+@pytest.mark.parametrize("scheduler", ["beta", "simple", "ddim_uniform", "karras"])
+def test_real_denoise_shown_is_the_basic_scheduler_one(comfy_env, scheduler):
+    # The plan shows a noise level pass's denoise with "=" when Schedule.exact. beta and
+    # ddim_uniform return fewer steps than they are asked for (232 for 233), and simple and
+    # ddim_uniform repeat sigmas past the model's 1000 timesteps, so the denoise must be
+    # BasicScheduler's for the length asked, int(steps / denoise), not for the length returned.
+    import comfy.model_sampling
+    import comfy.samplers
+
+    class FlowShift5(comfy.model_sampling.ModelSamplingDiscreteFlow, comfy.model_sampling.CONST):
+        pass
+
+    ms = FlowShift5(SimpleNamespace(sampling_settings={"shift": 5.0, "multiplier": 1000}))
+    patcher = SimpleNamespace(get_model_object=lambda name: ms)
+    for steps in (10, 25, 50, 200):
+        for level in (0.05, 0.1, 0.2, 0.3, 0.4, 0.6):
+            s = build_schedule(patcher, scheduler, steps, level, NOISE_LEVEL)
+            basic = comfy.samplers.calculate_sigmas(ms, scheduler, int(s.steps / s.denoise))[-(s.steps + 1):]
+            assert s.exact == torch.equal(basic, s.sigmas), (steps, level)
+            if s.steps == steps:  # every step asked: BasicScheduler gives the same pass
+                assert s.exact and float(basic[0]) == s.start_sigma, (steps, level)
+
+
 def test_build_schedules_rejects_unknown_steps_mode(comfy_stubs):
     with pytest.raises(ValueError, match="steps_mode"):
         build_schedules(_patcher(True), "simple", 25, [0.3], NOISE_LEVEL, "fast")

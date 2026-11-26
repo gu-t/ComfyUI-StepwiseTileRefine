@@ -48,13 +48,17 @@ def sigma_to_level(sigma, flow):
 def solve_total(start_sigma, steps, target, max_total, guess=None):
     """The schedule length whose first kept sigma is closest to `target`.
 
-    start_sigma(total) is the first of the last steps + 1 sigmas of a `total` step schedule,
-    non-increasing in total for every core scheduler. Lengths run from `steps` (the full
-    schedule, denoise 1) to `max_total`; a target above the full schedule's start gives the
-    full schedule, one below the longest schedule's start gives the longest.
+    start_sigma(total) is the first of the last steps + 1 sigmas of a `total` step schedule. It
+    falls with total for every core scheduler, but not strictly everywhere: beta drops repeated
+    sigmas itself and then rises a little in places (0.222 -> 0.232 at length 210 for 25 steps),
+    and linear_quadratic wobbles. Lengths run from `steps` (the full schedule, denoise 1) to
+    `max_total`; a target above the full schedule's start gives the full schedule, one below the
+    longest schedule's start gives the longest.
 
-    The answer is the one length lo with start(lo) > target >= start(lo + 1) (or lo + 1), so any
-    search that brackets it finds the same one. A schedule costs its length to build (normal and
+    Where start falls monotonically, the answer is the one length lo with start(lo) > target >=
+    start(lo + 1) (or lo + 1), so any search that brackets it finds the same one. Where it does
+    not, there can be several such crossings and the search finds one of them, whose start is
+    then a hair from the very nearest. A schedule costs its length to build (normal and
     sgm_uniform loop in Python, about 20 us a sigma), so the search stays near the answer instead
     of bisecting down from max_total: guess(n), when given, estimates the answer from the length
     n schedule; the search gallops from the last guess to bracket the answer and bisects inside.
@@ -127,13 +131,17 @@ class Schedule:
     total: int            # length of the schedule the sigmas were cut from, 0 when empty
     start_sigma: float
     start_level: float
-    # The BasicScheduler denoise that gives the same sigmas (steps / total). build_schedules'
-    # same-step-size passes give their share of the full schedule instead, fractional in noise
-    # level mode, which no denoise setting reproduces exactly.
+    # The BasicScheduler denoise of these sigmas: steps / total, total the length BasicScheduler
+    # asks the scheduler for. A pass with fewer steps than asked and build_schedules' same step
+    # size passes give their share of the schedule they were cut from instead, which a denoise
+    # setting may not reproduce; `exact` says whether it does.
     denoise: float
     # The steps asked for (build_schedule); more than `steps` when the scheduler has too few
     # distinct sigmas. 0 where the count is a share of one schedule (same step size).
     asked: int = 0
+    # True when BasicScheduler with `steps` and `denoise` gives exactly these sigmas (always in
+    # DENOISE mode, where the plan shows the noise level instead).
+    exact: bool = True
 
     @property
     def steps(self):
@@ -153,6 +161,19 @@ def drop_repeats(sigmas):
     import torch
 
     return torch.unique_consecutive(sigmas) if sigmas.numel() > 1 else sigmas
+
+
+def is_basic(raw, sigmas, denoise):
+    """Whether BasicScheduler with len(sigmas) - 1 steps and `denoise` gives exactly `sigmas`:
+    it asks the scheduler for int(steps / denoise) steps (raw(n), as calculate_sigmas returns
+    them) and keeps the last steps + 1."""
+    import torch
+
+    k = sigmas.numel() - 1
+    if k < 1 or denoise <= 0.0:
+        return False
+    f = raw(int(k / denoise))
+    return f.numel() > k and torch.equal(f[-(k + 1):], sigmas)
 
 
 def build_schedule(model_patcher, scheduler, steps, value, mode=NOISE_LEVEL):
@@ -183,11 +204,16 @@ def build_schedule(model_patcher, scheduler, steps, value, mode=NOISE_LEVEL):
     elif value <= 0.0:
         sigmas, total = torch.FloatTensor([]), 0
     else:
-        cache = {}
+        raw_cache, cache = {}, {}
+
+        def raw(n):
+            if n not in raw_cache:
+                raw_cache[n] = comfy.samplers.calculate_sigmas(model_sampling, scheduler, n).cpu()
+            return raw_cache[n]
 
         def full(n):
             if n not in cache:
-                cache[n] = drop_repeats(comfy.samplers.calculate_sigmas(model_sampling, scheduler, n).cpu())
+                cache[n] = drop_repeats(raw(n))
             return cache[n]
 
         def start(n):
@@ -216,7 +242,7 @@ def build_schedule(model_patcher, scheduler, steps, value, mode=NOISE_LEVEL):
         target = level_to_sigma(value, flow)
         longest = steps * MAX_TOTAL_FACTOR
         n = solve_total(start, steps, target, longest, guess)
-        sigmas, length = full(n)[-(steps + 1):], full(n)
+        sigmas, fewer = full(n)[-(steps + 1):], None
         if float(sigmas[0]) > target and n == longest:
             # No length has `steps` distinct sigmas from the level down, so the start lands above
             # it. The longest schedule's tail from the sigma nearest the level has fewer steps and
@@ -230,14 +256,25 @@ def build_schedule(model_patcher, scheduler, steps, value, mode=NOISE_LEVEL):
             below_nearer = j < f.numel() - 1 and abs(float(f[j]) - target) < abs(float(f[j - 1]) - target)
             tail = f[j if j == 0 or below_nearer else j - 1:]
             if tail.numel() - 1 < steps and abs(float(tail[0]) - target) < abs(float(sigmas[0]) - target):
-                sigmas, length = tail, f
-        total = length.numel() - 1  # the steps the scheduler returned for that length, repeats dropped
-        denoise = (sigmas.numel() - 1) / total
+                sigmas, fewer = tail, f
+        if fewer is None:
+            # BasicScheduler's denoise for length n. Its own count of what the scheduler returns
+            # does not matter: beta and ddim_uniform return fewer than n (232 for 233, say), and
+            # steps / 232 would make BasicScheduler ask for 232 and start elsewhere.
+            total, denoise = n, steps / n
+            if int(steps / denoise) < n:  # float: steps / (steps / n) can land a hair below n
+                denoise = math.nextafter(denoise, 0.0)
+        else:
+            # The share of the schedule the fewer steps were cut from, repeats dropped; no
+            # denoise setting gives these sigmas, since BasicScheduler keeps `steps` of them.
+            total = fewer.numel() - 1
+            denoise = (sigmas.numel() - 1) / total
 
     if sigmas.numel() < 2:
         return Schedule(mode, value, sigmas, 0, 0.0, 0.0, 0.0)
     first = float(sigmas[0])
-    return Schedule(mode, value, sigmas, total, first, sigma_to_level(first, flow), denoise, steps)
+    exact = mode == DENOISE or is_basic(raw, sigmas, denoise)
+    return Schedule(mode, value, sigmas, total, first, sigma_to_level(first, flow), denoise, steps, exact)
 
 
 def build_schedules(model_patcher, scheduler, steps, values, mode=NOISE_LEVEL, steps_mode=SAME_STEP_SIZE):
@@ -279,7 +316,11 @@ def build_schedules(model_patcher, scheduler, steps, values, mode=NOISE_LEVEL, s
 
     model_sampling = model_patcher.get_model_object("model_sampling")
     flow = is_flow(model_sampling)
-    full = drop_repeats(comfy.samplers.calculate_sigmas(model_sampling, scheduler, int(steps)).cpu())
+
+    def raw(n):
+        return comfy.samplers.calculate_sigmas(model_sampling, scheduler, n).cpu()
+
+    full = drop_repeats(raw(int(steps)))
     total = full.numel() - 1  # the steps the scheduler returned, repeats dropped
     schedules = []
     for v in values:
@@ -312,7 +353,9 @@ def build_schedules(model_patcher, scheduler, steps, values, mode=NOISE_LEVEL, s
         # share: the part of the full schedule the pass covers. In DENOISE mode it is the denoise
         # itself (rounded to whole steps); in NOISE_LEVEL mode it is fractional (2.4 / 25 in the
         # example above), so it only approximates a denoise setting, which samples whole steps.
-        schedules.append(Schedule(mode, v, sigmas, total, first, sigma_to_level(first, flow), share))
+        # A scaled tail is never BasicScheduler's; one that is not may be, and is_basic checks.
+        exact = mode == DENOISE or is_basic(raw, sigmas, share)
+        schedules.append(Schedule(mode, v, sigmas, total, first, sigma_to_level(first, flow), share, exact=exact))
     return schedules
 
 
