@@ -77,6 +77,9 @@ class Schedule:
     # same-step-size passes give their share of the full schedule instead, fractional in noise
     # level mode, which no denoise setting reproduces exactly.
     denoise: float
+    # The steps asked for (build_schedule); more than `steps` when the scheduler has too few
+    # distinct sigmas. 0 where the count is a share of one schedule (same step size).
+    asked: int = 0
 
     @property
     def steps(self):
@@ -89,9 +92,24 @@ def is_flow(model_sampling):
     return isinstance(model_sampling, comfy.model_sampling.CONST)
 
 
+def drop_repeats(sigmas):
+    """The sigmas without repeats in a row. Schedulers that pick from the model's timestep table
+    (simple, ddim_uniform) repeat entries when asked for more steps than the table has there; a
+    repeat is a step of length 0, a model call that changes nothing."""
+    import torch
+
+    return torch.unique_consecutive(sigmas) if sigmas.numel() > 1 else sigmas
+
+
 def build_schedule(model_patcher, scheduler, steps, value, mode=NOISE_LEVEL):
-    """Sigmas for one sampling run. DENOISE mode is BasicScheduler exactly; NOISE_LEVEL mode
-    cuts the same kind of tail from the schedule length whose start is nearest the level."""
+    """Sigmas for one sampling run, never with a sigma repeated. DENOISE mode is BasicScheduler
+    with its repeats dropped; NOISE_LEVEL mode cuts the same kind of tail from the schedule length
+    whose start is nearest the level.
+
+    A scheduler that picks from the model's 1000 timesteps (simple, beta, ddim_uniform) has few
+    distinct sigmas at low noise (on MOSS about 48 below 0.2), and no length gives more. A NOISE_LEVEL
+    pass that cannot cut `steps` distinct steps below its level then takes the ones there are,
+    from the sigma nearest the level, rather than start higher; `asked` keeps the count asked for."""
     import comfy.samplers
     import torch
 
@@ -105,8 +123,9 @@ def build_schedule(model_patcher, scheduler, steps, value, mode=NOISE_LEVEL):
     value = float(value)
 
     if mode == DENOISE:
-        sigmas = upscale.build_sigmas(model_patcher, scheduler, steps, value)
+        sigmas = drop_repeats(upscale.build_sigmas(model_patcher, scheduler, steps, value))
         total = 0 if value <= 0.0 else (steps if value >= 1.0 else int(steps / value))
+        denoise = steps / total if total else 0.0
     elif value <= 0.0:
         sigmas, total = torch.FloatTensor([]), 0
     else:
@@ -114,19 +133,39 @@ def build_schedule(model_patcher, scheduler, steps, value, mode=NOISE_LEVEL):
 
         def full(n):
             if n not in cache:
-                cache[n] = comfy.samplers.calculate_sigmas(model_sampling, scheduler, n).cpu()
+                cache[n] = drop_repeats(comfy.samplers.calculate_sigmas(model_sampling, scheduler, n).cpu())
             return cache[n]
 
         def start(n):
-            return float(full(n)[-(steps + 1)])
+            # Without its repeats (beta drops them itself) a length can give fewer than steps + 1
+            # sigmas. Such a schedule counts as starting above any level, so the search moves on
+            # to longer ones.
+            f = full(n)
+            return float(f[-(steps + 1)]) if f.numel() > steps else math.inf
 
-        total = solve_total(start, steps, level_to_sigma(value, flow), steps * MAX_TOTAL_FACTOR)
-        sigmas = full(total)[-(steps + 1):]
+        target = level_to_sigma(value, flow)
+        longest = steps * MAX_TOTAL_FACTOR
+        n = solve_total(start, steps, target, longest)
+        sigmas, length = full(n)[-(steps + 1):], full(n)
+        if float(sigmas[0]) > target:
+            # No length has `steps` distinct sigmas from the level down, so the start lands above
+            # it. The longest schedule's tail from the sigma nearest the level has fewer steps and
+            # starts where asked; it wins when it starts nearer (a dense scheduler's longest
+            # schedule has far more than `steps` below any level and is never taken).
+            f = full(longest)
+            j = int((f[:-1] >= target).sum())  # f[:j] are at or above the target
+            # The nearer of f[j - 1] and f[j], never the final 0.
+            below_nearer = j < f.numel() - 1 and abs(float(f[j]) - target) < abs(float(f[j - 1]) - target)
+            tail = f[j if j == 0 or below_nearer else j - 1:]
+            if tail.numel() - 1 < steps and abs(float(tail[0]) - target) < abs(float(sigmas[0]) - target):
+                sigmas, length = tail, f
+        total = length.numel() - 1  # the steps the scheduler returned for that length, repeats dropped
+        denoise = (sigmas.numel() - 1) / total
 
     if sigmas.numel() < 2:
         return Schedule(mode, value, sigmas, 0, 0.0, 0.0, 0.0)
     first = float(sigmas[0])
-    return Schedule(mode, value, sigmas, total, first, sigma_to_level(first, flow), steps / total)
+    return Schedule(mode, value, sigmas, total, first, sigma_to_level(first, flow), denoise, steps)
 
 
 def build_schedules(model_patcher, scheduler, steps, values, mode=NOISE_LEVEL, steps_mode=SAME_STEP_SIZE):
@@ -147,9 +186,10 @@ def build_schedules(model_patcher, scheduler, steps, values, mode=NOISE_LEVEL, s
     none is longer than the schedule's. A level on a schedule sigma keeps the tail as it is.
     DENOISE: the last ceil(steps * denoise) steps, as they are.
 
-    A scheduler may drop repeated sigmas (beta does at many steps), so the share is counted on the
-    schedule it returns, not on `steps`. Either way a pass gets at least 1 step, and a value of 0
-    samples nothing."""
+    Repeated sigmas are dropped (beta drops them itself, simple and ddim_uniform repeat when asked
+    for more than the model's 1000 timesteps), so the share is counted on the schedule without
+    them, not on `steps`. Either way a pass gets at least 1 step, and a value of 0 samples
+    nothing."""
     import torch
 
     if steps_mode not in STEPS_MODES:
@@ -167,8 +207,8 @@ def build_schedules(model_patcher, scheduler, steps, values, mode=NOISE_LEVEL, s
 
     model_sampling = model_patcher.get_model_object("model_sampling")
     flow = is_flow(model_sampling)
-    full = comfy.samplers.calculate_sigmas(model_sampling, scheduler, int(steps)).cpu()
-    total = full.numel() - 1  # the steps the scheduler returned, fewer than asked if it dropped repeats
+    full = drop_repeats(comfy.samplers.calculate_sigmas(model_sampling, scheduler, int(steps)).cpu())
+    total = full.numel() - 1  # the steps the scheduler returned, repeats dropped
     schedules = []
     for v in values:
         if v <= 0.0:
@@ -238,5 +278,5 @@ class NoiseLevelScheduler:
         else:
             info = (f"noise level {noise_level:.3f} -> start sigma {schedule.start_sigma:.4g} "
                     f"(level {schedule.start_level:.3f}), same as denoise {schedule.denoise:.4f} "
-                    f"with {scheduler}, {steps} steps")
+                    f"with {scheduler}, {schedule.steps} steps")
         return (schedule.sigmas, info)

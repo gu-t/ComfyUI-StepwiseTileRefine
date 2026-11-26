@@ -485,11 +485,14 @@ def _plural(n, word):
     return f"{n} {word}{'s' if n != 1 else ''}"
 
 
-def _step_head(s, value_label, schedule, steps_mode=None):
+def _step_head(s, value_label, schedule, steps_mode=None, scheduler=None):
     # "Step 1, noise level 0.450 (= denoise 0.140), 25 sampler steps": the setting, what it equals
     # in the other denoise mode and the steps it samples, when the run's schedule is known. A same
     # step size pass's denoise is a fractional share of the full schedule (noise_level.build_schedules),
-    # which no denoise setting gives exactly, so it is only "about".
+    # which no denoise setting gives exactly, so it is only "about". A start that misses the level
+    # by 0.01 or more is named, as a guard. Fewer steps than asked (noise_level.build_schedule
+    # never repeats a sigma) are named with the reason: in noise level mode the scheduler has no
+    # more distinct sigmas below the level, in denoise mode BasicScheduler's schedule repeated some.
     head = f"Step {s.index}, {value_label.lower()} {s.denoise:.3f}"
     if schedule is None:
         return head
@@ -497,10 +500,18 @@ def _step_head(s, value_label, schedule, steps_mode=None):
         return head + ", no sampling"
     if value_label.lower() == "noise level":
         sign = "~" if steps_mode == "same step size" else "="
-        head += f" ({sign} denoise {schedule.denoise:.3f})"
+        start = f"starts at {schedule.start_level:.3f}, " if abs(schedule.start_level - s.denoise) >= 0.01 else ""
+        head += f" ({start}{sign} denoise {schedule.denoise:.3f})"
     else:
         head += f" (= noise level {schedule.start_level:.3f})"
-    return head + f", {_plural(schedule.steps, 'sampler step')}"
+    head += f", {_plural(schedule.steps, 'sampler step')}"
+    if schedule.asked > schedule.steps:
+        if value_label.lower() == "noise level":
+            head += (f" ({schedule.asked} asked: {scheduler or 'the scheduler'} has only {schedule.steps} distinct "
+                     f"sigmas from {schedule.start_level:.3f} down)")
+        else:
+            head += f" ({schedule.asked} asked, repeated sigmas dropped)"
+    return head
 
 
 def _sampler_steps_line(steps_mode, steps, value_label, scheduler, schedules):
@@ -508,9 +519,10 @@ def _sampler_steps_line(steps_mode, steps, value_label, scheduler, schedules):
     # The mode names are noise_level's; this module stays stdlib only, so they are spelled out.
     by = f" ({scheduler})" if scheduler else ""
     if steps_mode == "same step size":
-        # The schedule the steps were cut from, which beta returns shorter when it drops repeats.
+        # The schedule the steps were cut from, shorter without its repeated sigmas (beta drops them
+        # itself; simple and ddim_uniform repeat past the model's 1000 timesteps).
         length = next((sc.total for sc in schedules if sc.total), steps)
-        dropped = f", {steps} asked, repeats dropped" if length != steps else ""
+        dropped = f", {steps} asked, repeated sigmas dropped" if length != steps else ""
         return (f"Sampler steps: same step size, each step's share of one {length}-step schedule over the whole "
                 f"noise range{by}{dropped}.")
     if steps_mode == "proportional to noise":
@@ -565,7 +577,7 @@ def format_plan(plan, sampler_steps=None, value_label="Denoise", shifting=None, 
     lines += [tiles, f"{rings} {grid_text}"]
     for i, s in enumerate(plan.steps):
         schedule = schedules[i] if schedules else None
-        lines += ["", _step_head(s, value_label, schedule, steps_mode), *_step_ops(plan, s, shifting)]
+        lines += ["", _step_head(s, value_label, schedule, steps_mode, scheduler), *_step_ops(plan, s, shifting)]
     f = plan.final
     if isinstance(f, FinalResample):
         verb = "shrink" if f.width <= f.src_width and f.height <= f.src_height else "resize"

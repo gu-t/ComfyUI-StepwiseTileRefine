@@ -69,6 +69,52 @@ def test_build_schedule_noise_level_mode(comfy_stubs, monkeypatch):
     assert 0.07 < s.denoise < 0.09   # MOSS shift 5: start noise 0.3 is denoise ~0.08 with simple
 
 
+def test_build_schedule_skips_lengths_too_short_to_cut_from(comfy_stubs, monkeypatch):
+    # beta drops repeated sigmas at many steps. Below length 40 this stub returns at most 20 steps,
+    # so 25 steps cannot be cut from lengths 25..39 and the search goes on to 40, the nearest that can.
+    def calc(ms, name, n):
+        return flow_simple(min(n, 20)) if n < 40 else flow_simple(n)
+
+    monkeypatch.setattr(sys.modules["comfy.samplers"], "calculate_sigmas", calc)
+    s = build_schedule(_patcher(True), "simple", 25, 0.95, NOISE_LEVEL)
+    assert s.total == 40 and s.steps == 25 and torch.equal(s.sigmas, flow_simple(40)[-26:])
+    assert s.denoise == pytest.approx(25 / 40)
+
+
+def test_build_schedule_takes_fewer_steps_rather_than_start_higher(comfy_stubs, monkeypatch):
+    # A scheduler that never returns more than 10 steps (1.0, 0.9 .. 0.357 at t = 0.1, then 0): the
+    # pass from 0.3 cannot have 25 steps, so it takes the one below the sigma nearest the level.
+    monkeypatch.setattr(sys.modules["comfy.samplers"], "calculate_sigmas",
+                        lambda ms, name, n: flow_simple(min(n, 10)))
+    s = build_schedule(_patcher(True), "simple", 25, 0.3, NOISE_LEVEL)
+    assert s.steps == 1 and s.asked == 25 and s.total == 10 and s.denoise == pytest.approx(0.1)
+    assert torch.equal(s.sigmas, flow_simple(10)[-2:])
+
+
+def _repeat_free(sigmas):
+    return bool((sigmas[:-1] > sigmas[1:]).all())
+
+
+def test_build_schedule_noise_level_never_repeats_a_sigma(comfy_stubs, monkeypatch):
+    # simple picks from 1000 timesteps and repeats past them. Below 0.2 that table has few sigmas
+    # (shift 5), so 100 steps per pass become the distinct ones there, from the nearest to 0.2.
+    monkeypatch.setattr(sys.modules["comfy.samplers"], "calculate_sigmas", lambda ms, name, n: flow_simple(n))
+    s = build_schedule(_patcher(True), "simple", 100, 0.2, NOISE_LEVEL)
+    table = flow_simple(1000)
+    distinct = int((table[:-1] < 0.2).sum()) + 1  # the nearest at or above 0.2, and all below
+    assert _repeat_free(s.sigmas) and s.asked == 100
+    assert distinct - 1 <= s.steps <= distinct < 100
+    assert s.start_level == pytest.approx(0.2, abs=0.005)
+
+
+def test_build_schedule_denoise_mode_drops_repeats(comfy_stubs, monkeypatch):
+    # BasicScheduler at denoise 0.02 schedules 2500 steps of simple, past its 1000 timesteps.
+    monkeypatch.setattr(sys.modules["comfy.samplers"], "calculate_sigmas", lambda ms, name, n: flow_simple(n))
+    s = build_schedule(_patcher(True), "simple", 50, 0.02, DENOISE)
+    assert torch.equal(s.sigmas, torch.unique_consecutive(flow_simple(2500)[-51:]))
+    assert _repeat_free(s.sigmas) and s.steps < 50 and s.asked == 50 and s.denoise == pytest.approx(0.02)
+
+
 def test_build_schedule_denoise_mode_is_basic_scheduler(comfy_stubs, monkeypatch):
     monkeypatch.setattr(sys.modules["comfy.samplers"], "calculate_sigmas", lambda ms, name, n: flow_simple(n))
     s = build_schedule(_patcher(True), "simple", 25, 0.22, DENOISE)
@@ -264,6 +310,26 @@ def test_same_step_size_on_real_beta_with_dropped_sigmas(comfy_env):
     (s,) = build_schedules(patcher, "beta", 500, [0.01], NOISE_LEVEL, SAME_STEP_SIZE)
     assert s.total == full.numel() - 1
     assert (s.steps - 1) / s.total < s.denoise <= s.steps / s.total + 1e-9
+
+
+@pytest.mark.comfy
+@pytest.mark.parametrize("steps_mode, steps", [(STEPS_PER_PASS, 200), (STEPS_PER_PASS, 500), (PROPORTIONAL, 500)])
+def test_real_beta_at_many_steps_does_not_crash(comfy_env, steps_mode, steps):
+    # beta returns 200 of 200 asked and 476 of 500, too short to cut 200 or 500 steps from at
+    # that length.
+    import comfy.model_sampling
+
+    class FlowShift5(comfy.model_sampling.ModelSamplingDiscreteFlow, comfy.model_sampling.CONST):
+        pass
+
+    ms = FlowShift5(SimpleNamespace(sampling_settings={"shift": 5.0, "multiplier": 1000}))
+    patcher = SimpleNamespace(get_model_object=lambda name: ms)
+    for level, s in zip([0.4, 0.2], build_schedules(patcher, "beta", steps, [0.4, 0.2], NOISE_LEVEL, steps_mode),
+                        strict=True):
+        # Fewer steps than asked, and the start where asked: about 118 distinct sigmas below 0.4.
+        assert 1 <= s.steps < s.asked and s.sigmas.numel() == s.steps + 1 and _repeat_free(s.sigmas)
+        assert s.start_level == pytest.approx(level, abs=0.005)
+        assert 0.0 < s.denoise <= 1.0
 
 
 def test_build_schedules_rejects_unknown_steps_mode(comfy_stubs):

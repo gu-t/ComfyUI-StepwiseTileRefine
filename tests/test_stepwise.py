@@ -557,6 +557,35 @@ def test_step_head_marks_a_fractional_same_step_size_denoise_as_about(steps_mode
     assert _step_head(step, "Denoise", denoise, steps_mode).endswith("(= noise level 0.400), 2 sampler steps")
 
 
+def test_step_head_says_why_a_pass_has_fewer_steps_than_asked():
+    from context_anchored_tile_refine.noise_level import Schedule
+    from context_anchored_tile_refine.stepwise_plan import _step_head
+
+    step = SimpleNamespace(index=2, denoise=0.2)
+    fewer = Schedule("noise level", 0.2, torch.linspace(0.201, 0.0, 49), 1000, 0.201, 0.201, 0.048, 200)
+    assert _step_head(step, "Noise level", fewer, "steps per pass", "simple") == (
+        "Step 2, noise level 0.200 (= denoise 0.048), 48 sampler steps "
+        "(200 asked: simple has only 48 distinct sigmas from 0.201 down)")
+    dropped = Schedule("denoise", 0.2, torch.linspace(0.5, 0.0, 41), 250, 0.5, 0.5, 0.2, 50)
+    assert _step_head(step, "Denoise", dropped, "steps per pass", "simple").endswith(
+        "40 sampler steps (50 asked, repeated sigmas dropped)")
+    full = Schedule("noise level", 0.2, torch.linspace(0.2, 0.0, 51), 1000, 0.2, 0.2, 0.05, 50)
+    assert _step_head(step, "Noise level", full, "steps per pass", "simple").endswith(", 50 sampler steps")
+
+
+def test_step_head_names_a_start_that_misses_the_level():
+    # A guard: a start 0.01 or more from the level is named.
+    from context_anchored_tile_refine.noise_level import Schedule
+    from context_anchored_tile_refine.stepwise_plan import _step_head
+
+    step = SimpleNamespace(index=1, denoise=0.4)
+    missed = Schedule("noise level", 0.4, torch.linspace(0.556, 0.0, 201), 1000, 0.556, 0.556, 0.2)
+    assert _step_head(step, "Noise level", missed, "steps per pass") == \
+        "Step 1, noise level 0.400 (starts at 0.556, = denoise 0.200), 200 sampler steps"
+    near = Schedule("noise level", 0.4, torch.linspace(0.405, 0.0, 51), 263, 0.405, 0.405, 0.19)
+    assert "starts at" not in _step_head(step, "Noise level", near, "steps per pass")
+
+
 def test_same_step_size_plan_names_the_schedule_length_returned():
     # beta drops repeated sigmas at many steps; the header names the schedule the steps were cut from.
     from context_anchored_tile_refine.noise_level import Schedule
@@ -568,7 +597,7 @@ def test_same_step_size_plan_names_the_schedule_length_returned():
     text = stepwise_plan.format_plan(plan, 200, "Noise level", schedules=[schedule(199)] * 2, scheduler="beta",
                                      steps_mode="same step size")
     assert ("Sampler steps: same step size, each step's share of one 199-step schedule over the whole noise range "
-            "(beta), 200 asked, repeats dropped.") in text
+            "(beta), 200 asked, repeated sigmas dropped.") in text
     text = stepwise_plan.format_plan(plan, 200, "Noise level", schedules=[schedule(200)] * 2, scheduler="beta",
                                      steps_mode="same step size")
     assert "one 200-step schedule over the whole noise range (beta)." in text
