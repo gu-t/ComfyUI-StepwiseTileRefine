@@ -494,9 +494,51 @@ def test_stepwise_denoise_drives_the_sigmas(comfy_stubs):
     # build_sigmas schedules int(steps / denoise) and keeps the last steps + 1, like BasicScheduler.
     StepwiseTileUpscale().upscale(_smooth_image(120, 160), _stepwise_guider(), object(), ZeroNoise(), ScaleVAE(16, 128),
                                   "simple", 10, 2.0, 2, 256, 256, 32, 32, 0.5, 0.25, False,
-                                  denoise_mode="denoise")
+                                  denoise_mode="denoise", steps_mode="steps per pass")
     totals = [call[2] for call in comfy_stubs["calculate_sigmas_calls"]]
     assert totals == [20, 40]
+
+
+# The stub schedule of length n is 0..n, so a schedule's tail names the length it was cut from.
+# Denoise 0.5 / 0.25 on 10 steps: steps per pass cuts 10 steps from 20 and from 40; same step size
+# takes the last ceil(10 x 0.5) = 5 and ceil(10 x 0.25) = 3 of the 10-step generation; proportional
+# to noise cuts 5 steps from int(5 / 0.5) = 10 and 3 from int(3 / 0.25) = 12.
+STEPS_MODE_CASES = {
+    "steps per pass": ([range(10, 21), range(30, 41)], "Sampler steps: 10 per step (simple)."),
+    "same step size": ([range(5, 11), range(7, 11)], "Sampler steps: same step size, each step's share of one "
+                                                     "10-step schedule over the whole noise range (simple)."),
+    "proportional to noise": ([range(5, 11), range(9, 13)], "Sampler steps: proportional to noise, 10 x each step's "
+                                                            "denoise, rounded up (simple)."),
+}
+
+
+@pytest.mark.parametrize("steps_mode", list(STEPS_MODE_CASES))
+def test_stepwise_steps_mode_drives_the_sigmas_and_the_plan(comfy_stubs, monkeypatch, steps_mode):
+    from context_anchored_tile_refine import sampling
+
+    seen = []
+    real = sampling.refine_image
+
+    def spy(image, guider, sampler, sigmas, *args, **kwargs):
+        seen.append(sigmas.clone())
+        return real(image, guider, sampler, sigmas, *args, **kwargs)
+
+    monkeypatch.setattr(sampling, "refine_image", spy)
+    _, _, text = StepwiseTileUpscale().upscale(
+        _smooth_image(120, 160), _stepwise_guider(), object(), ZeroNoise(), ScaleVAE(16, 128), "simple", 10, 2.0, 2,
+        256, 256, 32, 32, 0.5, 0.25, False, denoise_mode="denoise", steps_mode=steps_mode)
+    ranges, header = STEPS_MODE_CASES[steps_mode]
+    assert [s.tolist() for s in seen] == [list(r) for r in ranges]
+    counts = tuple(len(r) - 1 for r in ranges)
+    assert text.splitlines()[2] == header
+    assert f", {counts[0]} sampler steps" in text.split("Step 1,")[1].splitlines()[0]
+    assert f", {counts[1]} sampler steps" in text.split("Step 2,")[1].splitlines()[0]
+    import re
+
+    tiles = [int(m[1]) * int(m[2]) for m in re.finditer(r"(\d+)x(\d+) tiles, core", text)]
+    assert len(tiles) == 2
+    total = sum(n * c for n, c in zip(tiles, counts, strict=True))
+    assert f", {total} tile steps (tiles x sampler steps)." in text
 
 
 def test_auto_tile_cap_by_family():

@@ -481,26 +481,45 @@ def _step_ops(plan, s, shifting):
     return ops
 
 
+def _plural(n, word):
+    return f"{n} {word}{'s' if n != 1 else ''}"
+
+
 def _step_head(s, value_label, schedule):
-    # "Step 1, noise level 0.450 (= denoise 0.140)": the setting, and what it equals in the other
-    # denoise mode when the run's schedule is known.
+    # "Step 1, noise level 0.450 (= denoise 0.140), 25 sampler steps": the setting, what it equals
+    # in the other denoise mode and the steps it samples, when the run's schedule is known.
     head = f"Step {s.index}, {value_label.lower()} {s.denoise:.3f}"
     if schedule is None:
         return head
     if schedule.total == 0:
         return head + ", no sampling"
     if value_label.lower() == "noise level":
-        return head + f" (= denoise {schedule.denoise:.3f})"
-    return head + f" (= noise level {schedule.start_level:.3f})"
+        head += f" (= denoise {schedule.denoise:.3f})"
+    else:
+        head += f" (= noise level {schedule.start_level:.3f})"
+    return head + f", {_plural(schedule.steps, 'sampler step')}"
+
+
+def _sampler_steps_line(steps_mode, steps, value_label, scheduler):
+    # How the run's steps setting becomes every step's sampler steps (noise_level.build_schedules).
+    # The mode names are noise_level's; this module stays stdlib only, so they are spelled out.
+    by = f" ({scheduler})" if scheduler else ""
+    if steps_mode == "same step size":
+        return (f"Sampler steps: same step size, each step's share of one {steps}-step schedule over the whole "
+                f"noise range{by}.")
+    if steps_mode == "proportional to noise":
+        return f"Sampler steps: proportional to noise, {steps} x each step's {value_label.lower()}, rounded up{by}."
+    return f"Sampler steps: {steps} per step{by}."
 
 
 def format_plan(plan, sampler_steps=None, value_label="Denoise", shifting=None, schedules=None, tile_mode=None,
-                tile_size=None, scheduler=None):
+                tile_size=None, scheduler=None, steps_mode=None):
     """The plan as plain text (it is read in a text preview and the log, where Markdown shows raw): a
     header, every step's operations in the order they run, then warnings and notes. `shifting`
     (ShiftingTiles) replaces the fixed grid's tiles with the shifting grid's windows, for a plan
     made with fixed_grid False. `schedules` (noise_level.Schedule per step) adds what each step's
-    strength equals in the other denoise mode; the tile mode, tile size and scheduler only name
+    strength equals in the other denoise mode, its sampler steps and the run's total tile steps
+    (sampler_steps then only names the setting, with `steps_mode`, in the header); the tile mode, tile size and scheduler only name
     the run's settings."""
     g = plan.geometry
     n = len(plan.steps)
@@ -534,7 +553,10 @@ def format_plan(plan, sampler_steps=None, value_label="Denoise", shifting=None, 
                  f"{ring('tile_padding', plan.context_anchor, asked_anchor)}.")
     else:
         rings = f"Ring: tile_padding {plan.context_anchor} px (tile_overlap is not used)."
-    lines = ["STEPWISE TILE UPSCALE PLAN", head, tiles, f"{rings} {grid_text}"]
+    lines = ["STEPWISE TILE UPSCALE PLAN", head]
+    if schedules and steps_mode and sampler_steps:
+        lines.append(_sampler_steps_line(steps_mode, sampler_steps, value_label, scheduler))
+    lines += [tiles, f"{rings} {grid_text}"]
     for i, s in enumerate(plan.steps):
         schedule = schedules[i] if schedules else None
         lines += ["", _step_head(s, value_label, schedule), *_step_ops(plan, s, shifting)]
@@ -545,12 +567,22 @@ def format_plan(plan, sampler_steps=None, value_label="Denoise", shifting=None, 
                                    f"{_factors(f.width / f.src_width, f.height / f.src_height)}, {f.method}")]
     if shifting is None:
         count = plan.total_tiles
-        total = f"Total {count} tile{'s' if count != 1 else ''}"
+        total = f"Total {_plural(count, 'tile')}"
+        per_step = [(s.tiles, s.tiles) for s in plan.steps]
+        unit = "tile"
     else:
         low, high = sum(w[0] for w in shifting.windows), sum(w[1] for w in shifting.windows)
         total = f"Total {_fmt_span(low, high)} window{'s' if high != 1 else ''}"
-    if sampler_steps:
-        total += f" x {sampler_steps} sampler step{'s' if sampler_steps != 1 else ''}"
+        per_step = shifting.windows
+        unit = "window"
+    if schedules:
+        # Every tile (or window) of a step takes that step's sampler steps, so this is the run's
+        # model work, the number to compare steps_mode settings by.
+        low = sum(n[0] * sc.steps for n, sc in zip(per_step, schedules, strict=True))
+        high = sum(n[1] * sc.steps for n, sc in zip(per_step, schedules, strict=True))
+        total += f", {_fmt_span(low, high)} {unit} step{'s' if high != 1 else ''} ({unit}s x sampler steps)"
+    elif sampler_steps:
+        total += f" x {_plural(sampler_steps, 'sampler step')}"
         if scheduler:
             total += f" ({scheduler})"
     lines += ["", f"Output {plan.width}x{plan.height}. {total}."]

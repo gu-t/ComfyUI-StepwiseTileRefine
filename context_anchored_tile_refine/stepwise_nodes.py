@@ -12,7 +12,7 @@ from typing import ClassVar
 
 from .all_at_once import SIZE_FULL, TILE_BY_TILE, TILE_MODE_TOOLTIP, TILE_MODES, TILE_SIZE_TOOLTIP, TILE_SIZES
 from .node import MAX_RESOLUTION, ContextAnchoredTileRefine, _normalize_mask, _validate_image
-from .noise_level import DENOISE_MODES, NOISE_LEVEL
+from .noise_level import DENOISE_MODES, NOISE_LEVEL, SAME_STEP_SIZE, STEPS_MODES
 from .preview import GUESS, PREVIEW_MODE_TOOLTIP, PREVIEW_MODES
 from .stepwise_plan import (
     DEFAULT_DOWNSCALE_METHOD,
@@ -222,7 +222,10 @@ class StepwiseTileUpscale:
                 "denoise_first": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.001, "round": 0.001, "tooltip": "Strength of the first step, read as set by denoise_mode: the start noise level (default) or a BasicScheduler denoise."}),
                 "denoise_last": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.001, "round": 0.001, "tooltip": "Strength of the last step. Steps in between are interpolated linearly per step, and the step sizes grow by a constant factor, so the strength falls by the same amount per factor of size."}),
                 "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "simple", "tooltip": "How the noise levels are spaced. In denoise mode each step's sigmas are built like BasicScheduler; in noise level mode the schedule is cut so it starts at that step's noise level."}),
-                "steps": ("INT", {"default": 25, "min": 1, "max": 10000, "tooltip": "Sampler steps per tile at every upscale step."}),
+                # steps_mode went in beside steps 2026-11-26 (the owner's call): workflows saved before then
+                # shift every widget after steps by one.
+                "steps": ("INT", {"default": 50, "min": 1, "max": 10000, "tooltip": "Sampler steps per tile; steps_mode says how each refine pass gets its share, and the plan shows how many every pass samples."}),
+                "steps_mode": (list(STEPS_MODES), {"default": SAME_STEP_SIZE, "tooltip": "How each refine pass gets its sampler steps. same step size: `steps` is a full generation from pure noise, and each pass samples the part of that schedule below its own start, rounded up to whole steps, so all passes share its step size; a pass with little noise is quick. proportional to noise: each pass samples steps x its start noise level (or denoise), rounded up, so the noise falls by the same amount per step on average. steps per pass: every pass samples `steps`, so a pass with less noise takes smaller steps."}),
                 # Tiles.
                 **_tile_inputs({
                     "max_tile_width": ("INT", {"default": 0, "min": 0, "max": MAX_RESOLUTION, "step": 16, "tooltip": "Largest width the model sees per tile, overlap and padding included. 0 picks a size for the model family (1024 for SDXL/Flux/MOSS-class models, 768 for SD1.x/2.x)."}),
@@ -287,7 +290,8 @@ class StepwiseTileUpscale:
                 upscale_model=None, auto_step_factor=1.5, latent_scale=0, pixel_multiple=0,
                 denoise_mode=NOISE_LEVEL, oversample=1.0, oversample_mode=OVERSAMPLE_CONSTANT,
                 upscale_method=DEFAULT_UPSCALE_METHOD, downscale_method=DEFAULT_DOWNSCALE_METHOD,
-                tile_mode=TILE_BY_TILE, tile_size=SIZE_FULL, preview_mode=GUESS, output_size=DEFAULT_OUTPUT_SIZE):
+                tile_mode=TILE_BY_TILE, tile_size=SIZE_FULL, preview_mode=GUESS, output_size=DEFAULT_OUTPUT_SIZE,
+                steps_mode=SAME_STEP_SIZE):
         _validate_image(image)
         message = check_tiles(max_tile_width, max_tile_height, tile_padding, tile_overlap, auto=True)
         if message is not True:
@@ -303,14 +307,15 @@ class StepwiseTileUpscale:
                                    oversample_mode, upscale_method, downscale_method, tile_mode)
         except grid.GridConfigError as e:
             raise ValueError(_widget_names(str(e))) from e
-        schedules = [noise_level.build_schedule(guider.model_patcher, scheduler, steps, s.denoise, denoise_mode)
-                     for s in plan.steps]
+        schedules = noise_level.build_schedules(guider.model_patcher, scheduler, steps, [s.denoise for s in plan.steps],
+                                                denoise_mode, steps_mode)
         label = "Noise level" if denoise_mode == NOISE_LEVEL else "Denoise"
         from . import all_at_once
 
         shifting = all_at_once.shifting_tiles(plan, tile_size, tile_padding) if tile_mode == all_at_once.SHIFTING else None
         text = stepwise_plan.format_plan(plan, steps, value_label=label, shifting=shifting, schedules=schedules,
-                                         tile_mode=tile_mode, tile_size=tile_size, scheduler=scheduler)
+                                         tile_mode=tile_mode, tile_size=tile_size, scheduler=scheduler,
+                                         steps_mode=steps_mode)
         logging.info("Stepwise Tile Upscale:\n%s", text)
         if plan_only:
             return (image, [image], text)
@@ -321,9 +326,9 @@ class StepwiseTileUpscale:
         results = []
         for step, schedule in zip(plan.steps, schedules, strict=True):
             comfy.model_management.throw_exception_if_processing_interrupted()
-            logging.info("Stepwise Tile Upscale: step %d/%d, %dx%d -> %dx%d, start noise %.3f (denoise %.4f), %d tiles",
+            logging.info("Stepwise Tile Upscale: step %d/%d, %dx%d -> %dx%d, start noise %.3f (denoise %.4f), %d steps, %d tiles",
                          step.index, len(plan.steps), step.src_width, step.src_height, step.width, step.height,
-                         schedule.start_level, schedule.denoise, step.tiles)
+                         schedule.start_level, schedule.denoise, schedule.steps, step.tiles)
             current = enlarge(current, step.width, step.height, upscale_model if step.use_model else None, step.method,
                               step.enlarged if step.enlarge_width else None)
             current = sampling.refine_image(

@@ -21,6 +21,12 @@ NOISE_LEVEL = "noise level"
 DENOISE = "denoise"
 DENOISE_MODES = (NOISE_LEVEL, DENOISE)
 
+# How the passes of a Stepwise run get their steps (build_schedules), fewest to most steps at low noise.
+SAME_STEP_SIZE = "same step size"
+PROPORTIONAL = "proportional to noise"
+STEPS_PER_PASS = "steps per pass"
+STEPS_MODES = (SAME_STEP_SIZE, PROPORTIONAL, STEPS_PER_PASS)
+
 # Longest schedule the search tries, as a multiple of the sampler steps (denoise 0.001).
 MAX_TOTAL_FACTOR = 1000
 
@@ -69,6 +75,10 @@ class Schedule:
     start_level: float
     denoise: float        # the BasicScheduler denoise that gives the same sigmas (steps / total)
 
+    @property
+    def steps(self):
+        return max(0, self.sigmas.numel() - 1)
+
 
 def is_flow(model_sampling):
     import comfy.model_sampling
@@ -114,6 +124,76 @@ def build_schedule(model_patcher, scheduler, steps, value, mode=NOISE_LEVEL):
         return Schedule(mode, value, sigmas, 0, 0.0, 0.0, 0.0)
     first = float(sigmas[0])
     return Schedule(mode, value, sigmas, total, first, sigma_to_level(first, flow), steps / total)
+
+
+def build_schedules(model_patcher, scheduler, steps, values, mode=NOISE_LEVEL, steps_mode=SAME_STEP_SIZE):
+    """Sigmas for every pass of a run, one Schedule per value.
+
+    STEPS_PER_PASS: build_schedule per pass, `steps` steps each.
+
+    PROPORTIONAL: build_schedule per pass with ceil(steps * value) steps, the value being the start
+    noise level or the denoise, so every pass falls by the same noise per step on average (in
+    NOISE_LEVEL mode) and keeps the scheduler's own shape within the pass.
+
+    SAME_STEP_SIZE: `steps` are the steps of a full generation (denoise 1), and every pass samples
+    the tail of that one schedule below its own start, so all passes share its spacing, a pass with
+    less noise takes fewer steps, and no pass depends on the others' values. NOISE_LEVEL: the tail
+    starts at the last sigma at or above the level and is scaled down to start exactly at it, so a
+    level between two sigmas (2.4 steps of the schedule, say) gets the count rounded up (3) and no
+    step is longer than the schedule's. DENOISE: the last ceil(steps * denoise) steps, as they are.
+
+    Either way a pass gets at least 1 step, and a value of 0 samples nothing."""
+    import torch
+
+    if steps_mode not in STEPS_MODES:
+        raise ValueError(f"steps_mode must be one of {list(STEPS_MODES)}, got {steps_mode!r}")
+    if mode not in DENOISE_MODES:
+        raise ValueError(f"denoise_mode must be one of {list(DENOISE_MODES)}, got {mode!r}")
+    values = [float(v) for v in values]
+    if steps_mode == STEPS_PER_PASS:
+        return [build_schedule(model_patcher, scheduler, steps, v, mode) for v in values]
+    if steps_mode == PROPORTIONAL:
+        return [build_schedule(model_patcher, scheduler, min(steps, max(1, math.ceil(steps * v - 1e-9))), v, mode)
+                for v in values]
+
+    import comfy.samplers
+
+    model_sampling = model_patcher.get_model_object("model_sampling")
+    flow = is_flow(model_sampling)
+    total = int(steps)
+    full = comfy.samplers.calculate_sigmas(model_sampling, scheduler, total).cpu()
+    schedules = []
+    for v in values:
+        if v <= 0.0:
+            schedules.append(Schedule(mode, v, torch.FloatTensor([]), 0, 0.0, 0.0, 0.0))
+            continue
+        if mode == DENOISE:
+            n = min(total, max(1, math.ceil(total * v - 1e-9)))
+            sigmas = full[-(n + 1):]
+            share = n / total
+        else:
+            target = level_to_sigma(v, flow)
+            # Sigmas fall along the schedule, so those at or above the target are a prefix of it.
+            # The tolerance keeps a level that is a schedule sigma up to float error from adding a
+            # step.
+            above = int((full[:total] >= target * (1.0 - 1e-6)).sum())
+            if above == 0:  # above the schedule's top: the whole schedule
+                sigmas, share = full, 1.0
+            else:
+                j = above - 1
+                top, below = float(full[j]), float(full[j + 1])
+                sigmas = full[j:]
+                share = (total - j - 1) / total
+                if top > target:
+                    sigmas = sigmas * (target / top)
+                    share += (target - below) / (top - below) / total
+                else:
+                    share += 1.0 / total
+        first = float(sigmas[0])
+        # share: the part of the full schedule the pass covers, the BasicScheduler denoise of its
+        # start (in NOISE_LEVEL mode fractional, 2.4 / 25 in the example above).
+        schedules.append(Schedule(mode, v, sigmas, total, first, sigma_to_level(first, flow), share))
+    return schedules
 
 
 class NoiseLevelScheduler:

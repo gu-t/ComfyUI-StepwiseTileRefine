@@ -442,7 +442,7 @@ STEPWISE_ORDER = [
     "image", "guider", "sampler", "noise", "vae",
     "upscale_by", "output_size", "upscale_steps", "auto_step_factor", "oversample", "oversample_mode",
     "upscale_method", "downscale_method",
-    "denoise_mode", "denoise_first", "denoise_last", "scheduler", "steps",
+    "denoise_mode", "denoise_first", "denoise_last", "scheduler", "steps", "steps_mode",
     "tile_mode", "tile_size", "max_tile_width", "max_tile_height", "tile_overlap", "tile_padding",
     "plan_only",
     "upscale_model", "latent_scale", "pixel_multiple", "preview_mode",
@@ -480,6 +480,7 @@ def test_the_example_workflow_matches_the_widget_order(comfy_stubs):
     assert len(node["widgets_values"]) == len(widgets)
     values = dict(zip(widgets, node["widgets_values"], strict=True))
     assert values["tile_mode"] == TILE_BY_TILE and values["scheduler"] == "simple" and values["tile_padding"] == 32
+    assert values["steps_mode"] == "same step size" and values["steps"] == 50
 
 
 def test_stepwise_shifting_ignores_tile_overlap_in_the_plan(comfy_stubs):
