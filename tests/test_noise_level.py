@@ -423,6 +423,26 @@ def test_real_beta_at_many_steps_does_not_crash(comfy_env, steps_mode, steps):
 
 
 @pytest.mark.comfy
+@pytest.mark.parametrize("level", [0.035, 0.3, 0.9])
+def test_real_ddim_uniform_one_step_does_not_crash(comfy_env, level):
+    # ddim_uniform's timesteps start at 1, so its 1-step schedule starts near 0 (0.0099 on MOSS)
+    # at every length and no length reaches the level. The search must not then build length 0,
+    # where ddim_uniform divides by zero (found by a random plan_only sweep, 2026-11-27).
+    import comfy.model_sampling
+
+    class FlowShift5(comfy.model_sampling.ModelSamplingDiscreteFlow, comfy.model_sampling.CONST):
+        pass
+
+    ms = FlowShift5(SimpleNamespace(sampling_settings={"shift": 5.0, "multiplier": 1000}))
+    patcher = SimpleNamespace(get_model_object=lambda name: ms)
+    s = build_schedule(patcher, "ddim_uniform", 1, level, NOISE_LEVEL)
+    assert s.steps == 1 and s.sigmas.numel() == 2
+    assert 0.0 < s.start_level < 0.02
+    (p,) = build_schedules(patcher, "ddim_uniform", 7, [level / 7], NOISE_LEVEL, PROPORTIONAL)
+    assert p.steps == 1
+
+
+@pytest.mark.comfy
 @pytest.mark.parametrize("scheduler", ["beta", "simple", "ddim_uniform", "karras"])
 def test_real_denoise_shown_is_the_basic_scheduler_one(comfy_env, scheduler):
     # The plan shows a noise level pass's denoise with "=" when Schedule.exact. beta and

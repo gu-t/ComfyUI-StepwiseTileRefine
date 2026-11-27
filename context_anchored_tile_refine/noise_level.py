@@ -271,8 +271,10 @@ def build_schedule(model_patcher, scheduler, steps, value, mode=NOISE_LEVEL):
             # No length starts near the level. The search ends on a crossing, start(lo) > target
             # >= start(lo + 1), so lo is n or n - 1 (n == steps when the level is above the full
             # schedule's start, which is left as it is). Scale lo's tail down to the level.
+            # lo < steps is never built: a length shorter than `steps` has no such tail, and length
+            # 0 crashes ddim_uniform (its 1-step schedule starts near 0, below any level).
             lo = n if float(sigmas[0]) > target else n - 1
-            a = start(lo)
+            a = start(lo) if lo >= steps else math.inf
             if lo >= steps and math.isfinite(a) and a > target:
                 b = start(lo + 1)
                 n, sigmas = lo, full(lo)[-(steps + 1):] * (target / a)
