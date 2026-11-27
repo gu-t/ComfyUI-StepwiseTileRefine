@@ -203,9 +203,9 @@ def step_noise(noise, index):
 
 
 def run_bars(plan, schedules, shifting=None, pictures=1, upscale_model=None, node_id=None):
-    """The run's one bar (run_progress.RunProgress) and, per plan step, (upscale model part or None,
+    """The run's one bar (run_progress.RunProgress) and, per pass, (upscale model part or None,
     refine part). A refine part weighs what the plan text counts: tiles (the shifting grid's mean
-    windows per call) x sampler steps, times the pictures. The upscale model weighs its tiled_scale
+    windows per call) x steps, times the pictures. The upscale model weighs its tiled_scale
     tiles at run_progress.UPSCALE_TILE_WEIGHT tile steps each."""
     import comfy.utils
 
@@ -226,17 +226,18 @@ def run_bars(plan, schedules, shifting=None, pictures=1, upscale_model=None, nod
     run = run_progress.RunProgress(weights, node_id)
     parts = []
     for step, (model_slot, refine_slot) in zip(plan.steps, slots, strict=True):
-        label = f"step {step.index}/{n}"
+        label = f"pass {step.index}/{n}"
         model_part = None if model_slot is None else run.part(model_slot, label)
         parts.append((model_part, run.part(refine_slot, label)))
     return run, parts
 
 
 class StepwiseTileUpscale:
-    """Upscales in several steps. Each step enlarges in pixel space and runs a tile refine, with
-    strength (start noise level or denoise) falling from the first step to the last. Every step
+    """Upscales in several passes. Each pass enlarges in pixel space and runs a tile refine, with
+    strength (start noise level or denoise) falling from the first pass to the last. Every pass
     samples a size on the pixel grid, and an axis with less than a grid cell to grow keeps its
-    length for a step; output_size says how the output lands on the target."""
+    length for a pass; output_size says how the output lands on the target. The plan calls a pass
+    a step internally (plan.steps)."""
 
     @classmethod
     def INPUT_TYPES(s):
@@ -247,22 +248,24 @@ class StepwiseTileUpscale:
                 "image": ("IMAGE", {"tooltip": "The image to upscale."}),
                 "guider": ("GUIDER", {"tooltip": "The guider that denoises each tile, e.g. CFGGuider."}),
                 "sampler": ("SAMPLER", {"tooltip": "The sampler used for every tile."}),
-                "noise": ("NOISE", {"tooltip": "Noise is drawn once per step for the entire image and sliced for each tile."}),
+                "noise": ("NOISE", {"tooltip": "Noise is drawn once per pass for the entire image and sliced for each tile."}),
                 "vae": ("VAE", {"tooltip": "The VAE that encodes and decodes each tile. Its latent scale is read automatically."}),
                 # Size: how big the output gets and in how many passes.
                 "upscale_by": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 16.0, "step": 0.01, "tooltip": "Output size: the final image is round(input x upscale_by) on each axis (output_size says how it lands there). 1 keeps the input size (a pure repair run with oversample)."}),
-                "output_size": (list(OUTPUT_SIZES), {"default": DEFAULT_OUTPUT_SIZE, "tooltip": "How the output lands on round(input x upscale_by) when that is not a multiple of the pixel grid (16 px for MOSS). Every step before it is always on the grid. exact, crop edges: the last step runs a few px larger without stretching and is centre-cropped, so a few px of picture are lost at the edges. exact, pad edges during denoise: the right and bottom edges are padded with a mirrored strip while the last step denoises and cut off after; nothing mirrored is left in the image, but the model may misread the outermost pixels. stretch image: the output is a grid size near the target, chosen to keep the aspect: the rounding of the shorter axis is matched on the longer one, so both are off by about the same percentage (2147x344 becomes 2208x352 on a 32 px grid, +2.8 % and +2.3 %) and the aspect changes only slightly; the plan says by how much. With oversample the final resample hits the exact size, so only stretch image changes anything there."}),
-                "upscale_steps": ("INT", {"default": 0, "min": 0, "max": 16, "tooltip": "Number of refine passes. 0 picks the fewest whose growth per pass is at most auto_step_factor."}),
-                "auto_step_factor": ("FLOAT", {"default": 1.5, "min": 1.05, "max": 8.0, "step": 0.05, "tooltip": "Largest growth per pass when upscale_steps is 0 (auto). Unused when upscale_steps is set."}),
+                "output_size": (list(OUTPUT_SIZES), {"default": DEFAULT_OUTPUT_SIZE, "tooltip": "How the output lands on round(input x upscale_by) when that is not a multiple of the pixel grid (16 px for MOSS). Every pass before it is always on the grid. exact, crop edges: the last pass runs a few px larger without stretching and is centre-cropped, so a few px of picture are lost at the edges. exact, pad edges during denoise: the right and bottom edges are padded with a mirrored strip while the last pass denoises and cut off after; nothing mirrored is left in the image, but the model may misread the outermost pixels. stretch image: the output is a grid size near the target, chosen to keep the aspect: the rounding of the shorter axis is matched on the longer one, so both are off by about the same percentage (2147x344 becomes 2208x352 on a 32 px grid, +2.8 % and +2.3 %) and the aspect changes only slightly; the plan says by how much. With oversample the final resample hits the exact size, so only stretch image changes anything there."}),
+                # passes and auto_pass_factor were upscale_steps and auto_step_factor until 2026-11-27 (the
+                # owner's call). Saved workflows restore by position and keep working.
+                "passes": ("INT", {"default": 0, "min": 0, "max": 16, "tooltip": "Number of enlarge + refine passes. 0 picks the fewest whose growth per pass is at most auto_pass_factor."}),
+                "auto_pass_factor": ("FLOAT", {"default": 1.5, "min": 1.05, "max": 8.0, "step": 0.05, "tooltip": "Largest growth per pass when passes is 0 (auto). Unused when passes is set."}),
                 "oversample": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 8.0, "step": 0.01, "tooltip": "Runs the refine passes this much larger than the output track, then shrinks onto the exact output size after the last pass. The largest pass is input x upscale_by x oversample. Enlarging makes small objects bigger in pixels, so the passes can redraw them. 1 is off."}),
                 "oversample_mode": (list(OVERSAMPLE_MODES), {"default": OVERSAMPLE_CONSTANT, "tooltip": "constant: the first pass jumps to the oversample and every pass keeps it (enlarge, refine, shrink back each pass; at upscale_by 1 every pass runs at one size). ramp up: the passes grow evenly to input x upscale_by x oversample and reach it on the last pass."}),
                 "upscale_method": (list(UPSCALE_METHODS), {"default": DEFAULT_UPSCALE_METHOD, "tooltip": "Filter for every enlargement, soft to sharp. lanczos is Lanczos-3 in float. The bicubic variants are the Mitchell-Netravali family: B-spline is the softest with no ringing, Catmull-Rom the sharpest."}),
                 "downscale_method": (list(DOWNSCALE_METHODS), {"default": DEFAULT_DOWNSCALE_METHOD, "tooltip": "Filter for the shrink onto the output size after the last pass (the resamples between passes always enlarge). area is the exact mean of the covered pixels and never rings. Every filter is widened by the shrink factor, so all source pixels count however large the reduction."}),
                 # Strength: how much each pass redraws, and the schedule it samples.
-                "denoise_mode": (list(DENOISE_MODES), {"default": NOISE_LEVEL, "tooltip": "noise level: denoise_first/last are the share of noise each step starts from (0..1, the flow sigma; sigma / (1 + sigma) on SD/SDXL-type models), the same for every scheduler. denoise: they are BasicScheduler denoise values, whose start noise depends on the scheduler and the model's shift. The plan shows both for every step."}),
-                "denoise_first": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.001, "round": 0.001, "tooltip": "Strength of the first step, read as set by denoise_mode: the start noise level (default) or a BasicScheduler denoise."}),
-                "denoise_last": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.001, "round": 0.001, "tooltip": "Strength of the last step. Steps in between are interpolated linearly per step, and the step sizes grow by a constant factor, so the strength falls by the same amount per factor of size."}),
-                "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "simple", "tooltip": "How the noise levels are spaced. In denoise mode each step's sigmas are built like BasicScheduler; in noise level mode the schedule is cut so it starts at that step's noise level."}),
+                "denoise_mode": (list(DENOISE_MODES), {"default": NOISE_LEVEL, "tooltip": "noise level: denoise_first/last are the share of noise each pass starts from (0..1, the flow sigma; sigma / (1 + sigma) on SD/SDXL-type models), the same for every scheduler. denoise: they are BasicScheduler denoise values, whose start noise depends on the scheduler and the model's shift. The plan shows both for every pass."}),
+                "denoise_first": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.001, "round": 0.001, "tooltip": "Strength of the first pass, read as set by denoise_mode: the start noise level (default) or a BasicScheduler denoise."}),
+                "denoise_last": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.001, "round": 0.001, "tooltip": "Strength of the last pass. Passes in between are interpolated linearly per pass, and the pass sizes grow by a constant factor, so the strength falls by the same amount per factor of size."}),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "simple", "tooltip": "How the noise levels are spaced. In denoise mode each pass's sigmas are built like BasicScheduler; in noise level mode the schedule is cut so it starts at that pass's noise level."}),
                 # steps_mode went in beside steps 2026-11-26 (the owner's call): workflows saved before then
                 # shift every widget after steps by one.
                 "steps": ("INT", {"default": 50, "min": 1, "max": 10000, "tooltip": "Sampler steps per tile; steps_mode says how each refine pass gets its share, and the plan shows how many every pass samples."}),
@@ -275,7 +278,7 @@ class StepwiseTileUpscale:
                 "plan_only": ("BOOLEAN", {"default": False, "tooltip": "Only compute and output the plan, without sampling. The image passes through unchanged."}),
             },
             "optional": {
-                "upscale_model": ("UPSCALE_MODEL", {"tooltip": "Optional. Used for the first step only, then upscale_method to that step's exact size."}),
+                "upscale_model": ("UPSCALE_MODEL", {"tooltip": "Optional. Used for the first pass only, then upscale_method to that pass's exact size."}),
                 **_latent_geometry_inputs(),
                 **_preview_inputs(),
             },
@@ -283,16 +286,16 @@ class StepwiseTileUpscale:
         }
 
     RETURN_TYPES = ("IMAGE", "IMAGE", "STRING")
-    RETURN_NAMES = ("image", "step_images", "plan")
+    RETURN_NAMES = ("image", "pass_images", "plan")
     OUTPUT_IS_LIST = (False, True, False)
     OUTPUT_TOOLTIPS = (
         "The final image at round(input x upscale_by), or with output_size stretch image a grid size near it that keeps the aspect.",
-        "The result of every step, for inspection (a list, since the sizes differ).",
-        "The plan as plain text: sizes, factors, aspect deviation, tiles and what the model sees, rings, noise and enlargement per step.",
+        "The result of every pass, for inspection (a list, since the sizes differ).",
+        "The plan as plain text: sizes, factors, aspect deviation, tiles and what the model sees, rings, noise and enlargement per pass.",
     )
     FUNCTION = "upscale"
     CATEGORY = CATEGORY
-    DESCRIPTION = "Upscales in several enlarge + tile refine steps and plans the steps itself. Works with any VAE latent scale."
+    DESCRIPTION = "Upscales in several enlarge + tile refine passes and plans the passes itself. Works with any VAE latent scale."
     SEARCH_ALIASES: ClassVar[list[str]] = ["stepwise upscale", "multi step upscale", "tiled upscale", "moss upscale"]
 
     @classmethod
@@ -300,9 +303,9 @@ class StepwiseTileUpscale:
         return check_tiles(max_tile_width, max_tile_height, tile_padding, tile_overlap, auto=True)
 
     @staticmethod
-    def build_plan(image, guider, vae, upscale_by, upscale_steps, max_tile_width, max_tile_height, tile_padding,
+    def build_plan(image, guider, vae, upscale_by, passes, max_tile_width, max_tile_height, tile_padding,
                    tile_overlap, denoise_first, denoise_last, upscale_model=None, output_size=DEFAULT_OUTPUT_SIZE,
-                   auto_step_factor=1.5, latent_scale=0, pixel_multiple=0, oversample=1.0,
+                   auto_pass_factor=1.5, latent_scale=0, pixel_multiple=0, oversample=1.0,
                    oversample_mode=OVERSAMPLE_CONSTANT, upscale_method=DEFAULT_UPSCALE_METHOD,
                    downscale_method=DEFAULT_DOWNSCALE_METHOD, tile_mode=TILE_BY_TILE):
         from . import all_at_once, stepwise_plan
@@ -320,16 +323,16 @@ class StepwiseTileUpscale:
         if upscale_model is not None:
             model_scale = float(getattr(upscale_model, "scale", 1.0))
         return stepwise_plan.plan_upscale(
-            int(image.shape[2]), int(image.shape[1]), float(upscale_by), int(upscale_steps), geometry, cap_w, cap_h,
+            int(image.shape[2]), int(image.shape[1]), float(upscale_by), int(passes), geometry, cap_w, cap_h,
             int(tile_padding), int(tile_overlap), float(denoise_first), float(denoise_last),
             upscale_model_scale=model_scale,
-            auto_step_factor=float(auto_step_factor), oversample=float(oversample), oversample_mode=oversample_mode,
+            auto_step_factor=float(auto_pass_factor), oversample=float(oversample), oversample_mode=oversample_mode,
             upscale_method=upscale_method, downscale_method=downscale_method,
             fixed_grid=tile_mode != all_at_once.SHIFTING, output_size=output_size)
 
-    def upscale(self, image, guider, sampler, noise, vae, scheduler, steps, upscale_by, upscale_steps, max_tile_width,
+    def upscale(self, image, guider, sampler, noise, vae, scheduler, steps, upscale_by, passes, max_tile_width,
                 max_tile_height, tile_padding, tile_overlap, denoise_first, denoise_last, plan_only,
-                upscale_model=None, auto_step_factor=1.5, latent_scale=0, pixel_multiple=0,
+                upscale_model=None, auto_pass_factor=1.5, latent_scale=0, pixel_multiple=0,
                 denoise_mode=NOISE_LEVEL, oversample=1.0, oversample_mode=OVERSAMPLE_CONSTANT,
                 upscale_method=DEFAULT_UPSCALE_METHOD, downscale_method=DEFAULT_DOWNSCALE_METHOD,
                 tile_mode=TILE_BY_TILE, tile_size=SIZE_FULL, preview_mode=GUESS, output_size=DEFAULT_OUTPUT_SIZE,
@@ -343,9 +346,9 @@ class StepwiseTileUpscale:
         from . import grid, noise_level, resample, sampling, stepwise_plan
 
         try:
-            plan = self.build_plan(image, guider, vae, upscale_by, upscale_steps, max_tile_width, max_tile_height,
+            plan = self.build_plan(image, guider, vae, upscale_by, passes, max_tile_width, max_tile_height,
                                    tile_padding, tile_overlap, denoise_first, denoise_last, upscale_model,
-                                   output_size, auto_step_factor, latent_scale, pixel_multiple, oversample,
+                                   output_size, auto_pass_factor, latent_scale, pixel_multiple, oversample,
                                    oversample_mode, upscale_method, downscale_method, tile_mode)
         except grid.GridConfigError as e:
             raise ValueError(_widget_names(str(e))) from e
@@ -370,7 +373,7 @@ class StepwiseTileUpscale:
         with run:
             for step, schedule, (model_bar, refine_bar) in zip(plan.steps, schedules, parts, strict=True):
                 comfy.model_management.throw_exception_if_processing_interrupted()
-                logging.info("Stepwise Tile Upscale: step %d/%d, %dx%d -> %dx%d, start noise %.3f (denoise %.4f), %d steps, %d tiles",
+                logging.info("Stepwise Tile Upscale: pass %d/%d, %dx%d -> %dx%d, start noise %.3f (denoise %.4f), %d steps, %d tiles",
                              step.index, len(plan.steps), step.src_width, step.src_height, step.width, step.height,
                              schedule.start_level, schedule.denoise, schedule.steps, step.tiles)
                 current = enlarge(current, step.width, step.height, upscale_model if step.use_model else None,
@@ -383,7 +386,7 @@ class StepwiseTileUpscale:
                 current = current.to(comfy.model_management.intermediate_device())
                 if (int(current.shape[2]), int(current.shape[1])) != (step.width, step.height):
                     raise RuntimeError(
-                        f"Stepwise Tile Upscale: step {step.index} produced {int(current.shape[2])}x{int(current.shape[1])}, "
+                        f"Stepwise Tile Upscale: pass {step.index} produced {int(current.shape[2])}x{int(current.shape[1])}, "
                         f"expected {step.width}x{step.height}")
                 results.append(current)
         if isinstance(plan.final, stepwise_plan.FinalCrop):

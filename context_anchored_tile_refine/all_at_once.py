@@ -245,9 +245,11 @@ class TiledModelWrapper:
         self.check_interrupt = check_interrupt
         self.calls = 0
         # preview_mode (preview.py): the hub sees every window's cond answer, and `emit` sends what
-        # it renders. Both None by default.
+        # it renders. Both None by default. `on_window(index, count, device, cond_or_uncond)` runs
+        # before every window, for the run bar's status line.
         self.hub = hub
         self.emit = None
+        self.on_window = None
 
     def __call__(self, apply_model, args):
         x, timestep, c = args["input"], args["timestep"], args["c"]
@@ -260,9 +262,11 @@ class TiledModelWrapper:
         if self.log is not None:
             self.log.append((sigma, dy, dx, len(windows)))
         out = wsum = None
-        for win in windows:
+        for index, win in enumerate(windows):
             if self.check_interrupt is not None:
                 self.check_interrupt()
+            if self.on_window is not None:
+                self.on_window(index, len(windows), x.device, args.get("cond_or_uncond"))
             ys, xs = slice(win.y0, win.y1), slice(win.x0, win.x1)
             tile_c = {key: _slice_spatial(value, height, width, ys, xs) for key, value in c.items()}
             tile_x = x[..., ys, xs]
@@ -449,7 +453,9 @@ def _guarded_callback(guider, sigmas, wrapper, bar=None, batch_size=1, batch_ind
     # With a preview_mode hub on the wrapper the callback keeps its own progress bar, so the
     # wrapper's per-window previews (one tile at a time) land on the step the run is at.
     # With a run bar (run_progress.Part) every step reports there instead, this picture's steps
-    # after the batch's earlier pictures, and names itself on the status line.
+    # after the batch's earlier pictures, and the status line names the step in progress and the
+    # tile (window) of the model call. A sampler that calls the model twice per step counts the
+    # tiles twice.
     import latent_preview
 
     steps = sigmas.shape[-1] - 1
@@ -483,16 +489,44 @@ def _guarded_callback(guider, sigmas, wrapper, bar=None, batch_size=1, batch_ind
         shown = wrapper.hub.canvas_step
     at = {"step": 0}
     wrapper.emit = lambda image: pbar.update_absolute(offset + at["step"], total, image)
-    prefix = picture_prefix(batch_size, batch_index)
+    if bar is not None:
+        prefix = picture_prefix(batch_size, batch_index)
+
+        def on_window(index, count, device, cond_or_uncond):
+            # Python queues a window's work on the device and moves on. Without a wait the line names
+            # windows the device has not reached, and the wait lands on a later one. The fixed grid
+            # waited only by accident (its blend weights are copied to the device per window), the
+            # shifting grid not at all.
+            _wait_for(device)
+            prompt = _prompt_word(cond_or_uncond)
+            bar.note(f"{prefix}step {min(at['step'] + 1, steps)}/{steps} · {prompt}tile {index + 1}/{count}")
+
+        wrapper.on_window = on_window
 
     def callback(step, x0, x, total_steps):
         _require_wrapper_used(wrapper)
         at["step"] = step + 1
-        if bar is not None:
-            bar.note(f"{prefix}sampler step {step + 1}/{steps}")
         pbar.update_absolute(offset + step + 1, total, shown(x0, x))
 
     return callback
+
+
+def _prompt_word(cond_or_uncond):
+    # "pos · " / "neg · " for a model call that carries one prompt only: core runs the positive and the
+    # negative prompt as two calls (so the tiles go round twice per step) when their conds cannot be
+    # batched, which on MOSS is whenever their token counts differ. Nothing for a batched call.
+    kinds = set(cond_or_uncond or ())
+    if kinds == {0}:
+        return "pos · "
+    if kinds == {1}:
+        return "neg · "
+    return ""
+
+
+def _wait_for(device):
+    # Until the device has run everything queued on it. Nothing to wait for on the CPU.
+    if device.type != "cpu" and torch.accelerator.is_available():
+        torch.accelerator.synchronize(device)
 
 
 # --- the Stepwise plan --------------------------------------------------------------------------

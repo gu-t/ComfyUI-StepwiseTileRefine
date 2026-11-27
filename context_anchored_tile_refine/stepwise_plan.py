@@ -506,11 +506,11 @@ def _step_ops(plan, s, shifting):
 
 
 def _plural(n, word):
-    return f"{n} {word}{'s' if n != 1 else ''}"
+    return f"{n} {word}{('es' if word.endswith('s') else 's') if n != 1 else ''}"
 
 
 def _step_head(s, value_label, schedule, scheduler=None):
-    # "Step 1, noise level 0.450 (= denoise 0.140), 25 sampler steps": the setting, what it equals
+    # "Pass 1, noise level 0.450 (= denoise 0.140), 25 steps": the setting, what it equals
     # in the other denoise mode and the steps it samples, when the run's schedule is known. The
     # denoise is "=" only where BasicScheduler with it gives exactly these sigmas (Schedule.exact),
     # "~" otherwise: a same step size pass's fractional share, or a pass with fewer steps than
@@ -518,7 +518,7 @@ def _step_head(s, value_label, schedule, scheduler=None):
     # asked (noise_level.build_schedule never repeats a sigma) are named with the reason: in noise
     # level mode the scheduler has no more distinct sigmas below the level, in denoise mode
     # BasicScheduler's schedule repeated some.
-    head = f"Step {s.index}, {value_label.lower()} {s.denoise:.3f}"
+    head = f"Pass {s.index}, {value_label.lower()} {s.denoise:.3f}"
     if schedule is None:
         return head
     if schedule.total == 0:
@@ -529,7 +529,7 @@ def _step_head(s, value_label, schedule, scheduler=None):
         head += f" ({start}{sign} denoise {schedule.denoise:.3f})"
     else:
         head += f" (= noise level {schedule.start_level:.3f})"
-    head += f", {_plural(schedule.steps, 'sampler step')}"
+    head += f", {_plural(schedule.steps, 'step')}"
     if schedule.asked > schedule.steps:
         if value_label.lower() == "noise level":
             head += (f" ({schedule.asked} asked: {scheduler or 'the scheduler'} has only {schedule.steps} distinct "
@@ -554,11 +554,11 @@ def _sampler_steps_line(steps_mode, steps, value_label, scheduler, schedules):
             why = f", {steps} asked, the scheduler returns more"
         else:
             why = ""
-        return (f"Sampler steps: same step size, each step's share of one {length}-step schedule over the whole "
+        return (f"Steps: same step size, each pass's share of one {length}-step schedule over the whole "
                 f"noise range{by}{why}.")
     if steps_mode == "proportional to noise":
-        return f"Sampler steps: proportional to noise, {steps} x each step's {value_label.lower()}, rounded up{by}."
-    return f"Sampler steps: {steps} per step{by}."
+        return f"Steps: proportional to noise, {steps} x each pass's {value_label.lower()}, rounded up{by}."
+    return f"Steps: {steps} per pass{by}."
 
 
 def format_plan(plan, sampler_steps=None, value_label="Denoise", shifting=None, schedules=None, tile_mode=None,
@@ -576,7 +576,7 @@ def format_plan(plan, sampler_steps=None, value_label="Denoise", shifting=None, 
     head = f"Source {plan.src_width}x{plan.src_height}, x{plan.factor:g} -> {asked[0]}x{asked[1]}"
     if plan.oversample != 1.0:
         head += f", oversample x{plan.oversample:g} {plan.oversample_mode}"
-    head += f", {n} step{'s' if n != 1 else ''}."
+    head += f", {_plural(n, 'pass')}."
     # output_size only acts on a target off the grid, and with oversample only as a stretch.
     off_grid = asked[0] % g.multiple or asked[1] % g.multiple
     if off_grid and (plan.oversample == 1.0 or plan.output_size == OUTPUT_STRETCH):
@@ -627,13 +627,13 @@ def format_plan(plan, sampler_steps=None, value_label="Denoise", shifting=None, 
         work_low = sum(w[0] * sc.steps for w, sc in zip(per_step, schedules, strict=True))
         work_high = sum(w[1] * sc.steps for w, sc in zip(per_step, schedules, strict=True))
         total += (f", {_fmt_span(work_low, work_high)} {unit} step{'s' if work_high != 1 else ''} "
-                  f"({unit}s x sampler steps)")
+                  f"({unit}s x steps)")
     elif sampler_steps:
-        total += f" x {_plural(sampler_steps, 'sampler step')}"
+        total += f" x {_plural(sampler_steps, 'step')}"
         if scheduler:
             total += f" ({scheduler})"
     lines += ["", f"Output {plan.width}x{plan.height}. {total}."]
-    warn = [f"  {w}" for w in plan.warnings] + [f"  Step {s.index}: {w}" for s in plan.steps for w in s.warnings]
+    warn = [f"  {w}" for w in plan.warnings] + [f"  Pass {s.index}: {w}" for s in plan.steps for w in s.warnings]
     if warn:
         lines += ["", "WARNINGS", *warn]
     if plan.notes:

@@ -1,6 +1,8 @@
 """The fork nodes' one progress bar (run_progress.py): a value that never goes down, a total fixed
 before the run that the value reaches exactly, and a status line sent only when it changes, in
 every tile mode, over several passes and a batch. Without a run bar the engines report as before."""
+import itertools
+import re
 import sys
 import types
 
@@ -118,11 +120,11 @@ def test_a_preview_is_sent_even_when_the_value_stays(comfy_stubs):
 
 def test_the_status_is_sent_once_per_change_and_ends_with_the_outcome(comfy_stubs, status):
     with run_progress.RunProgress([10], node_id="7") as run:
-        part = run.part(0, "step 1/2")
+        part = run.part(0, "pass 1/2")
         part.note("tile 1/3")
         part.note("tile 1/3")
         part.note("tile 2/3")
-    assert [t for t, _ in status[:2]] == ["step 1/2 · tile 1/3", "step 1/2 · tile 2/3"]
+    assert [t for t, _ in status[:2]] == ["pass 1/2 · tile 1/3", "pass 1/2 · tile 2/3"]
     assert status[-1][0].startswith("done in ") and {n for _, n in status} == {"7"}
     with pytest.raises(RuntimeError), run_progress.RunProgress([10], node_id="7"):
         raise RuntimeError("boom")
@@ -158,14 +160,18 @@ def test_stepwise_fills_one_bar_over_every_pass(counting_tiled_scale, status, ti
     assert final.shape[0] == pictures
     bar = _the_one_bar(counting_tiled_scale)
     texts = [t for t, _ in status]
-    assert texts[0] == "step 1/3 · upscale model"
+    assert texts[0] == "pass 1/3 · upscale model"
     assert texts[-1].startswith("done in ")
-    assert len(texts) == len(set(texts))
+    assert all(a != b for a, b in itertools.pairwise(texts))
     picture = "image 2/2 · " if pictures == 2 else ""
-    if tile_mode == TILE_BY_TILE:
-        assert any(t.startswith(f"step 3/3 · {picture}tile ") for t in texts)
-    else:
-        assert any(t.startswith(f"step 3/3 · {picture}sampler step ") for t in texts)
+    # tile by tile runs every step of a tile before the next tile, all at once every tile of a step
+    # (here the fake guider's two model calls per step) before the next step.
+    inner = (r"tile (\d+)/(\d+) · step (\d+)/(\d+)" if tile_mode == TILE_BY_TILE
+             else r"step (\d+)/(\d+) · pos · tile (\d+)/(\d+)")
+    levels = [re.fullmatch(rf"pass ([1-3])/3 · (?:image [12]/{pictures} · )?{inner}", t) for t in texts[1:-1]]
+    assert all(levels), texts
+    assert all(int(m[2]) <= int(m[3]) and int(m[4]) <= int(m[5]) for m in levels)
+    assert any(t.startswith(f"pass 3/3 · {picture}") for t in texts)
     # Every refine pass moves the bar: one value per unit the engine reports.
     assert len({v for v, _, _ in bar.updates}) > 3 * pictures
 
@@ -183,7 +189,7 @@ def test_stepwise_weights_follow_the_plan_text(comfy_stubs):
     units = [1, tiles[0] * 5 * 2, tiles[1] * 4 * 2, 0]  # 0.1 x 1 model tile x 2 pictures, rounded up
     assert run.ends == [sum(units[:i + 1]) * run.scale for i in range(4)]
     assert parts[0][0] is not None and parts[1][0] is None and parts[2][0] is None
-    assert parts[1][1].label == "step 2/3"
+    assert parts[1][1].label == "pass 2/3"
 
 
 @pytest.mark.parametrize("tile_mode", TILE_MODES)
@@ -199,6 +205,8 @@ def test_tile_refine_fills_one_bar_over_the_batch(comfy_stubs, status, tile_mode
     assert sum(1 for _, _, p in bar.updates if p is not None) == 4 * (len(guider.calls) if tile_mode == TILE_BY_TILE
                                                                        else pictures)
     texts = [t for t, _ in status]
+    inner = r"tile \d+/\d+ · step \d+/4" if tile_mode == TILE_BY_TILE else r"step \d/4 · pos · tile \d+/\d+"
+    assert all(re.fullmatch(rf"(?:image \d/{pictures} · )?{inner}", t) for t in texts[:-1]), texts
     if pictures > 1:
         assert any(t.startswith(f"image {pictures}/{pictures} · ") for t in texts)
     assert comfy_stubs["prepare_callback_args"] is None
@@ -265,3 +273,35 @@ def test_guarded_callback_without_a_bar_or_hub_is_cores(comfy_stubs):
     all_at_once._guarded_callback(_stepwise_guider(), SIGMAS, wrapper)(0, None, None, 4)
     assert comfy_stubs["callback_calls"] == [(0, 4)]
     assert comfy_stubs["progress_bars"] == []
+
+
+@pytest.mark.parametrize("tile_mode", [ALL_AT_ONCE, SHIFTING])
+def test_the_status_line_waits_for_the_device_before_every_tile(comfy_stubs, status, monkeypatch, tile_mode):
+    # Python queues a window's work and moves on, so the line waits for the device before it names
+    # the next tile; without a run bar nothing waits.
+    events = []
+    monkeypatch.setattr(all_at_once, "_wait_for", lambda device: events.append(("wait", device.type)))
+    monkeypatch.setattr(run_progress, "send_status", lambda node_id, text: events.append(("note", text)))
+    guider = WrapperGuider()
+    TileRefineAnyVAE().refine(_smooth_image(600, 744), guider, object(), SIGMAS, ScaleVAE(16, 128), ZeroNoise(),
+                              256, 256, 16, 32, tile_mode=tile_mode, unique_id="3")
+    tiles = [i for i, e in enumerate(events) if e[0] == "note" and " · tile " in e[1]]
+    assert tiles and len(guider.tile_sizes) == sum(1 for e in events if e[0] == "wait")
+    assert all(events[i - 1] == ("wait", "cpu") for i in tiles)
+    assert events[0] == ("wait", "cpu")
+    events.clear()
+    sampling.refine_image(_smooth_image(600, 744), WrapperGuider(), object(), SIGMAS, ScaleVAE(16, 128), ZeroNoise(),
+                          256, 256, 16, 32, tile_mode=tile_mode)
+    assert events == []
+
+
+def test_waiting_for_the_cpu_is_a_no_op():
+    all_at_once._wait_for(torch.device("cpu"))
+
+
+@pytest.mark.parametrize("chunks, word", [([0], "pos · "), ([1], "neg · "), ([0, 1], ""), ([1, 0], ""), ([0, 0], "pos · "),
+                                          (None, "")])
+def test_the_status_line_names_a_call_with_one_prompt(chunks, word):
+    # Core runs the positive and the negative prompt as separate calls when it cannot batch them, so
+    # the tiles go round twice per step; the line says which round it is.
+    assert all_at_once._prompt_word(chunks) == word

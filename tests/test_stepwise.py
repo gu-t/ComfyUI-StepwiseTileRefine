@@ -250,7 +250,7 @@ def test_plan_warns_that_a_crop_at_upscale_by_one_resamples(size, warned):
             "back, which softens it slightly. output_size \"exact, pad edges during denoise\" avoids the resample "
             "and keeps every edge pixel." in text) == warned
     assert "Total 1 tile." in text
-    assert "Total 1 tile x 1 sampler step." in stepwise_plan.format_plan(plan, sampler_steps=1)
+    assert "Total 1 tile x 1 step." in stepwise_plan.format_plan(plan, sampler_steps=1)
     assert ("Output size:" in text) == warned
     pad = stepwise_plan.plan_upscale(*size, 1.0, 1, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.3, 0.3,
                                      output_size=stepwise_plan.OUTPUT_PAD)
@@ -298,20 +298,20 @@ def test_plan_example_from_the_brief():
         "  pad      2880x1620 -> 2880x1632   mirrored",
         "  denoise  2880x1632                4x2 tiles, core 720x816",
         "  crop     2880x1632 -> 2880x1620",
-    ], "Step 1: mirrored edge during denoise, 12 px at the bottom"),
+    ], "Pass 1: mirrored edge during denoise, 12 px at the bottom"),
     (stepwise_plan.OUTPUT_STRETCH, [
         "  enlarge  1920x1080 -> 2880x1616   x1.500 / x1.496, lanczos, aspect +0.25%",
         "  denoise  2880x1616                4x2 tiles, core 720x816/800",
     ], "Output 2880x1616 instead of 2880x1620: height -4 px (-0.25%)"),
 ])
 def test_plan_output_size(output_size, ops, warning):
-    # The plan lists every operation of a step in the order it runs.
+    # The plan lists every operation of a pass in the order it runs.
     plan = stepwise_plan.plan_upscale(1920, 1080, 1.5, 1, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.4, 0.4,
                                       output_size=output_size)
     text = stepwise_plan.format_plan(plan, value_label="Noise level")
-    assert f"Source 1920x1080, x1.5 -> 2880x1620, 1 step. Output size: {output_size}." in text
+    assert f"Source 1920x1080, x1.5 -> 2880x1620, 1 pass. Output size: {output_size}." in text
     lines = text.splitlines()
-    first = lines.index("Step 1, noise level 0.400") + 1
+    first = lines.index("Pass 1, noise level 0.400") + 1
     assert lines[first:first + len(ops)] == ops
     assert f"Output {plan.width}x{plan.height}." in text
     if output_size == stepwise_plan.OUTPUT_CROP:
@@ -345,7 +345,7 @@ def test_plan_text_lists_every_step():
     plan = stepwise_plan.plan_upscale(1280, 976, 3.0, 3, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.45, 0.22)
     text = stepwise_plan.format_plan(plan, 25)
     assert "Source 1280x976, x3 -> 3840x2928" in text
-    assert sum(line.startswith("Step ") for line in text.splitlines()) == len(plan.steps)
+    assert sum(line.startswith("Pass ") for line in text.splitlines()) == len(plan.steps)
     assert "|" not in text and "#" not in text
     assert "Pixel grid 16 px." in text
 
@@ -470,13 +470,13 @@ def test_stepwise_node_end_to_end(comfy_stubs, scale, channels, multiple, src, f
     vae = ScaleVAE(scale, channels, require=multiple or scale)
     image = _smooth_image(h, w)
     node = StepwiseTileUpscale()
-    final, step_images, text = node.upscale(
+    final, pass_images, text = node.upscale(
         image, _stepwise_guider(), object(), ZeroNoise(), vae, "simple", 4, factor, steps, 256, 256, 32, 32,
         0.5, 0.2, False, pixel_multiple=multiple)
     assert (final.shape[2], final.shape[1]) == (round(w * factor), round(h * factor))
-    assert step_images[-1] is final
+    assert pass_images[-1] is final
     if steps:
-        assert len(step_images) == steps
+        assert len(pass_images) == steps
     assert "STEPWISE TILE UPSCALE PLAN" in text
     for cw, ch in vae.encode_shapes:
         assert cw % (multiple or scale) == 0 and ch % (multiple or scale) == 0 and cw <= 256 and ch <= 256
@@ -490,12 +490,12 @@ def test_stepwise_node_output_size(comfy_stubs, output_size, size):
     # (the tiles of a padded canvas are on the grid too, so the encodes cannot tell): the other
     # two sample grid sizes on every step, which their step images show.
     vae = ScaleVAE(16, 128)
-    final, step_images, text = StepwiseTileUpscale().upscale(
+    final, pass_images, text = StepwiseTileUpscale().upscale(
         _smooth_image(122, 160), _stepwise_guider(), object(), ZeroNoise(), vae, "simple", 4, 3.0, 2, 256, 256, 32, 32,
         0.5, 0.2, False, output_size=output_size)
     assert (final.shape[2], final.shape[1]) == size
-    assert len(step_images) == 2 and step_images[-1] is final
-    assert all(img.shape[1] % 16 == 0 and img.shape[2] % 16 == 0 for img in step_images[:-1])
+    assert len(pass_images) == 2 and pass_images[-1] is final
+    assert all(img.shape[1] % 16 == 0 and img.shape[2] % 16 == 0 for img in pass_images[:-1])
     assert ("mirrored" in text) == (output_size == stepwise_plan.OUTPUT_PAD)
 
 
@@ -536,10 +536,10 @@ def test_stepwise_denoise_drives_the_sigmas(comfy_stubs):
 # takes the last ceil(10 x 0.5) = 5 and ceil(10 x 0.25) = 3 of the 10-step generation; proportional
 # to noise cuts 5 steps from int(5 / 0.5) = 10 and 3 from int(3 / 0.25) = 12.
 STEPS_MODE_CASES = {
-    "steps per pass": ([range(10, 21), range(30, 41)], "Sampler steps: 10 per step (simple)."),
-    "same step size": ([range(5, 11), range(7, 11)], "Sampler steps: same step size, each step's share of one "
+    "steps per pass": ([range(10, 21), range(30, 41)], "Steps: 10 per pass (simple)."),
+    "same step size": ([range(5, 11), range(7, 11)], "Steps: same step size, each pass's share of one "
                                                      "10-step schedule over the whole noise range (simple)."),
-    "proportional to noise": ([range(5, 11), range(9, 13)], "Sampler steps: proportional to noise, 10 x each step's "
+    "proportional to noise": ([range(5, 11), range(9, 13)], "Steps: proportional to noise, 10 x each pass's "
                                                             "denoise, rounded up (simple)."),
 }
 
@@ -563,14 +563,14 @@ def test_stepwise_steps_mode_drives_the_sigmas_and_the_plan(comfy_stubs, monkeyp
     assert [s.tolist() for s in seen] == [list(r) for r in ranges]
     counts = tuple(len(r) - 1 for r in ranges)
     assert text.splitlines()[2] == header
-    assert f", {counts[0]} sampler steps" in text.split("Step 1,")[1].splitlines()[0]
-    assert f", {counts[1]} sampler steps" in text.split("Step 2,")[1].splitlines()[0]
+    assert f", {counts[0]} steps" in text.split("Pass 1,")[1].splitlines()[0]
+    assert f", {counts[1]} steps" in text.split("Pass 2,")[1].splitlines()[0]
     import re
 
     tiles = [int(m[1]) * int(m[2]) for m in re.finditer(r"(\d+)x(\d+) tiles, core", text)]
     assert len(tiles) == 2
     total = sum(n * c for n, c in zip(tiles, counts, strict=True))
-    assert f", {total} tile steps (tiles x sampler steps)." in text
+    assert f", {total} tile steps (tiles x steps)." in text
 
 
 @pytest.mark.parametrize("exact, sign", [(True, "="), (False, "~")])
@@ -582,9 +582,9 @@ def test_step_head_marks_a_denoise_basic_scheduler_does_not_give_as_about(exact,
 
     step = SimpleNamespace(index=1, denoise=0.31)
     schedule = Schedule("noise level", 0.31, torch.tensor([0.31, 0.2, 0.0]), 25, 0.31, 0.31, 0.0912, exact=exact)
-    assert _step_head(step, "Noise level", schedule) == f"Step 1, noise level 0.310 ({sign} denoise 0.091), 2 sampler steps"
+    assert _step_head(step, "Noise level", schedule) == f"Pass 1, noise level 0.310 ({sign} denoise 0.091), 2 steps"
     denoise = Schedule("denoise", 0.1, torch.tensor([0.4, 0.2, 0.0]), 25, 0.4, 0.4, 0.08)
-    assert _step_head(step, "Denoise", denoise).endswith("(= noise level 0.400), 2 sampler steps")
+    assert _step_head(step, "Denoise", denoise).endswith("(= noise level 0.400), 2 steps")
 
 
 def test_step_head_says_why_a_pass_has_fewer_steps_than_asked():
@@ -594,13 +594,13 @@ def test_step_head_says_why_a_pass_has_fewer_steps_than_asked():
     step = SimpleNamespace(index=2, denoise=0.2)
     fewer = Schedule("noise level", 0.2, torch.linspace(0.201, 0.0, 49), 1000, 0.201, 0.201, 0.048, 200, False)
     assert _step_head(step, "Noise level", fewer, "simple") == (
-        "Step 2, noise level 0.200 (~ denoise 0.048), 48 sampler steps "
+        "Pass 2, noise level 0.200 (~ denoise 0.048), 48 steps "
         "(200 asked: simple has only 48 distinct sigmas from 0.201 down)")
     dropped = Schedule("denoise", 0.2, torch.linspace(0.5, 0.0, 41), 250, 0.5, 0.5, 0.2, 50)
     assert _step_head(step, "Denoise", dropped, "simple").endswith(
-        "40 sampler steps (50 asked, repeated sigmas dropped)")
+        "40 steps (50 asked, repeated sigmas dropped)")
     full = Schedule("noise level", 0.2, torch.linspace(0.2, 0.0, 51), 1000, 0.2, 0.2, 0.05, 50)
-    assert _step_head(step, "Noise level", full, "simple").endswith(", 50 sampler steps")
+    assert _step_head(step, "Noise level", full, "simple").endswith(", 50 steps")
 
 
 def test_step_head_names_a_start_that_misses_the_level():
@@ -611,7 +611,7 @@ def test_step_head_names_a_start_that_misses_the_level():
     step = SimpleNamespace(index=1, denoise=0.4)
     missed = Schedule("noise level", 0.4, torch.linspace(0.556, 0.0, 201), 1000, 0.556, 0.556, 0.2)
     assert _step_head(step, "Noise level", missed) == \
-        "Step 1, noise level 0.400 (starts at 0.556, = denoise 0.200), 200 sampler steps"
+        "Pass 1, noise level 0.400 (starts at 0.556, = denoise 0.200), 200 steps"
     near = Schedule("noise level", 0.4, torch.linspace(0.405, 0.0, 51), 263, 0.405, 0.405, 0.19)
     assert "starts at" not in _step_head(step, "Noise level", near)
 
@@ -626,7 +626,7 @@ def test_same_step_size_plan_names_the_schedule_length_returned():
 
     text = stepwise_plan.format_plan(plan, 200, "Noise level", schedules=[schedule(199)] * 2, scheduler="beta",
                                      steps_mode="same step size")
-    assert ("Sampler steps: same step size, each step's share of one 199-step schedule over the whole noise range "
+    assert ("Steps: same step size, each pass's share of one 199-step schedule over the whole noise range "
             "(beta), 200 asked, repeated sigmas dropped.") in text
     text = stepwise_plan.format_plan(plan, 200, "Noise level", schedules=[schedule(200)] * 2, scheduler="beta",
                                      steps_mode="same step size")
@@ -634,7 +634,7 @@ def test_same_step_size_plan_names_the_schedule_length_returned():
     # ddim_uniform returns more than asked (63 for 60): nothing was dropped.
     text = stepwise_plan.format_plan(plan, 60, "Noise level", schedules=[schedule(63)] * 2, scheduler="ddim_uniform",
                                      steps_mode="same step size")
-    assert ("Sampler steps: same step size, each step's share of one 63-step schedule over the whole noise range "
+    assert ("Steps: same step size, each pass's share of one 63-step schedule over the whole noise range "
             "(ddim_uniform), 60 asked, the scheduler returns more.") in text
 
 
@@ -870,12 +870,12 @@ class SeedNoise(ZeroNoise):
 def test_stepwise_node_repair_loop_end_to_end(comfy_stubs, upscale_by, oversample, mode):
     image = _smooth_image(120, 160)
     log = []
-    final, step_images, text = StepwiseTileUpscale().upscale(
+    final, pass_images, text = StepwiseTileUpscale().upscale(
         image, _stepwise_guider(), object(), SeedNoise(log), ScaleVAE(16, 128), "simple", 4, upscale_by, 3, 256, 256,
         32, 32, 0.7, 0.7, False, oversample=oversample, oversample_mode=mode,
         downscale_method="bicubic (catmull-rom)")
     assert (final.shape[2], final.shape[1]) == (round(160 * upscale_by), round(120 * upscale_by))
-    assert len(step_images) == 4 and step_images[-1] is final
+    assert len(pass_images) == 4 and pass_images[-1] is final
     assert "\nFinal\n" in text
     # Each pass draws its noise on its own seed.
     assert sorted(set(log)) == [3, 4, 5]

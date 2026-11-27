@@ -426,11 +426,11 @@ def test_all_at_once_modes_reject_a_mask(comfy_stubs, tile_mode):
 def test_stepwise_node_tile_modes_end_to_end(comfy_stubs, tile_mode, heading):
     image = _smooth_image(120, 160)
     guider = WrapperGuider() if tile_mode != TILE_BY_TILE else _stepwise_guider()
-    final, step_images, text = StepwiseTileUpscale().upscale(
+    final, pass_images, text = StepwiseTileUpscale().upscale(
         image, guider, object(), ZeroNoise(), ScaleVAE(16, 128), "simple", 4, 3.0, 3, 256, 256, 32, 32, 0.5, 0.2,
         False, tile_mode=tile_mode, tile_size=SIZE_FULL)
     assert (final.shape[2], final.shape[1]) == (480, 360)
-    assert len(step_images) == 3 and heading in text
+    assert len(pass_images) == 3 and heading in text
     if tile_mode != TILE_BY_TILE:
         assert len(guider.calls) == 3
         assert max(max(s) for s in guider.tile_sizes) == 256 // 16
@@ -440,7 +440,7 @@ def test_stepwise_node_tile_modes_end_to_end(comfy_stubs, tile_mode, heading):
 
 STEPWISE_ORDER = [
     "image", "guider", "sampler", "noise", "vae",
-    "upscale_by", "output_size", "upscale_steps", "auto_step_factor", "oversample", "oversample_mode",
+    "upscale_by", "output_size", "passes", "auto_pass_factor", "oversample", "oversample_mode",
     "upscale_method", "downscale_method",
     "denoise_mode", "denoise_first", "denoise_last", "scheduler", "steps", "steps_mode",
     "tile_mode", "tile_size", "max_tile_width", "max_tile_height", "tile_overlap", "tile_padding",
@@ -502,7 +502,7 @@ def test_stepwise_shifting_plan_text_shows_the_shifting_grid(comfy_stubs):
             1024, 1024, 32, 32, 0.45, 0.22, True)
     _, _, text = StepwiseTileUpscale().upscale(*args, tile_mode=SHIFTING)
     assert " tiles" not in text and "do not apply" not in text
-    assert sum(line.startswith("Step ") for line in text.splitlines()) == 3
+    assert sum(line.startswith("Pass ") for line in text.splitlines()) == 3
     assert "Ring: tile_padding 32 px, core 960x960 px (tile_overlap is not used)." in text
     assert sum(line.startswith("  denoise ") and line.endswith("windows per model call")
                for line in text.splitlines()) == 3

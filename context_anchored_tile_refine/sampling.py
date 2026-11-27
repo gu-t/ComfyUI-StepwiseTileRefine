@@ -392,8 +392,8 @@ def make_tile_progress(model_patcher, steps, n_tiles, batch_size=1, batch_index=
     # every picture. batch_size/batch_index come from refine_image's picture loop: every
     # picture reports on the SAME total and starts where the previous picture ended, so the
     # bar advances once across the whole run instead of restarting at each picture.
-    # bar (run_progress.Part) is the run's bar to report on instead of a new one, and each tile
-    # names itself on its status line.
+    # bar (run_progress.Part) is the run's bar to report on instead of a new one, and the status
+    # line names the tile and the sampler step in progress.
     import comfy.utils
     import latent_preview
 
@@ -403,9 +403,14 @@ def make_tile_progress(model_patcher, steps, n_tiles, batch_size=1, batch_index=
     offset = per_picture * batch_index
     pbar = comfy.utils.ProgressBar(total) if bar is None else bar
 
+    prefix = run_progress.picture_prefix(batch_size, batch_index)
+
     def for_tile(tile_idx):
-        if bar is not None:
-            bar.note(f"{run_progress.picture_prefix(batch_size, batch_index)}tile {tile_idx + 1}/{n_tiles}")
+        def note(step):
+            if bar is not None:
+                bar.note(f"{prefix}tile {tile_idx + 1}/{n_tiles} · step {step}/{steps}")
+
+        note(1)
 
         def callback(step, x0, x, total_steps):
             preview = None
@@ -419,6 +424,8 @@ def make_tile_progress(model_patcher, steps, n_tiles, batch_size=1, batch_index=
                     x0 = x0.tensors[0]
                 preview = previewer.decode_latent_to_preview_image("JPEG", x0) if hub is None else hub.tile_step(x0, x)
             pbar.update_absolute(offset + tile_idx * steps + step + 1, total, preview)
+            if step + 1 < steps:
+                note(step + 2)
         return callback
 
     return for_tile

@@ -69,7 +69,7 @@ def stepwise(image_name, prompt, upscale_by, upscale_steps=0, seed=1, steps=25, 
     img = g.add("LoadImage", image=image_name)
     inputs = dict(image=[img, 0], guider=[guider, 0], sampler=[samp, 0], noise=[noise, 0], vae=[vae, 0],
                   scheduler=scheduler, steps=steps, steps_mode=steps_mode, upscale_by=upscale_by,
-                  output_size=output_size, upscale_steps=upscale_steps, auto_step_factor=auto_step_factor,
+                  output_size=output_size, passes=upscale_steps, auto_pass_factor=auto_step_factor,
                   max_tile_width=max_tile, max_tile_height=max_tile, tile_padding=anchor, tile_overlap=overlap,
                   tile_mode=tile_mode, tile_size=tile_size,
                   denoise_first=denoise_first, denoise_last=denoise_last, denoise_mode=denoise_mode,
