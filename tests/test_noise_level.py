@@ -442,8 +442,46 @@ def test_real_denoise_shown_is_the_basic_scheduler_one(comfy_env, scheduler):
             s = build_schedule(patcher, scheduler, steps, level, NOISE_LEVEL)
             basic = comfy.samplers.calculate_sigmas(ms, scheduler, int(s.steps / s.denoise))[-(s.steps + 1):]
             assert s.exact == torch.equal(basic, s.sigmas), (steps, level)
-            if s.steps == steps:  # every step asked: BasicScheduler gives the same pass
-                assert s.exact and float(basic[0]) == s.start_sigma, (steps, level)
+            if s.steps == steps:
+                # Every step asked: BasicScheduler gives the same pass, unless no length starts
+                # near the level and the tail was scaled down to start exactly at it.
+                if s.exact:
+                    assert float(basic[0]) == s.start_sigma, (steps, level)
+                else:
+                    assert s.start_sigma == pytest.approx(level, abs=1e-6), (steps, level)
+
+
+@pytest.mark.comfy
+@pytest.mark.parametrize("scheduler", ["ddim_uniform", "karras", "exponential", "kl_optimal"])
+@pytest.mark.parametrize("steps_mode", [STEPS_PER_PASS, PROPORTIONAL])
+def test_real_coarse_schedulers_scale_the_tail_to_the_level(comfy_env, scheduler, steps_mode):
+    # ddim_uniform has only about 1000 / steps distinct tails (0.40 at 50 steps started at 0.357),
+    # and karras, exponential and kl_optimal step coarsely near full noise or with few steps. Where
+    # no length starts near the level, the nearest tail above it is scaled down to start there:
+    # the steps asked, no repeats, every step shrunk by the same factor, never "=".
+    import comfy.model_sampling
+    import comfy.samplers
+
+    class FlowShift5(comfy.model_sampling.ModelSamplingDiscreteFlow, comfy.model_sampling.CONST):
+        pass
+
+    ms = FlowShift5(SimpleNamespace(sampling_settings={"shift": 5.0, "multiplier": 1000}))
+    patcher = SimpleNamespace(get_model_object=lambda name: ms)
+    levels = [0.95, 0.6, 0.4, 0.3, 0.2, 0.1]
+    scaled = 0
+    for steps in (25, 50, 60, 80, 200):
+        for level, s in zip(levels, build_schedules(patcher, scheduler, steps, levels, NOISE_LEVEL, steps_mode),
+                            strict=True):
+            assert _repeat_free(s.sigmas) and 1 <= s.steps <= s.asked, (steps, level)
+            if s.steps < s.asked:
+                continue  # too few distinct sigmas below the level: fewer steps, nearest sigma
+            assert s.start_level == pytest.approx(level, abs=noise_level.LEVEL_TOLERANCE), (steps, level)
+            tail = noise_level.drop_repeats(comfy.samplers.calculate_sigmas(ms, scheduler, s.total))[-(s.steps + 1):]
+            if not torch.equal(tail, s.sigmas):
+                scaled += 1
+                assert not s.exact and float(tail[0]) > s.start_sigma, (steps, level)
+                assert torch.allclose(s.sigmas, tail * (s.start_sigma / float(tail[0]))), (steps, level)
+    assert scaled > 0
 
 
 @pytest.mark.comfy

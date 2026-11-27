@@ -31,6 +31,10 @@ STEPS_MODES = (SAME_STEP_SIZE, PROPORTIONAL, STEPS_PER_PASS)
 MAX_TOTAL_FACTOR = 1000
 # Most guesses solve_total refines before it brackets the answer by galloping.
 GUESS_ROUNDS = 4
+# Largest miss of the start level that build_schedule leaves as the scheduler gives it; past it
+# the tail is scaled down to start exactly at the level. simple, beta, normal, sgm_uniform and
+# linear_quadratic stay within it (MOSS shift 5 and SD1.5, 25 to 200 steps, levels 0.1 to 0.6).
+LEVEL_TOLERANCE = 0.005
 
 
 def level_to_sigma(level, flow):
@@ -134,8 +138,9 @@ class Schedule:
     # The BasicScheduler denoise of these sigmas: steps / the length BasicScheduler asks the
     # scheduler for (total in build_schedule, the `steps` setting for build_schedules' same step
     # size passes). A pass with fewer steps than asked gives its share of the schedule it was cut
-    # from instead, and a same step size tail scaled to its level a fractional count, which no
-    # denoise setting reproduces; `exact` says whether this one does.
+    # from instead, and a tail scaled to its level (same step size, or build_schedule where no
+    # length starts near it) a fractional count, which no denoise setting reproduces; `exact`
+    # says whether this one does.
     denoise: float
     # The steps asked for (build_schedule); more than `steps` when the scheduler has too few
     # distinct sigmas. 0 where the count is a share of one schedule (same step size).
@@ -191,6 +196,14 @@ def build_schedule(model_patcher, scheduler, steps, value, mode=NOISE_LEVEL):
     with its repeats dropped; NOISE_LEVEL mode cuts the same kind of tail from the schedule length
     whose start is nearest the level.
 
+    Where no length starts within LEVEL_TOLERANCE of the level, the tail of the nearest length that
+    starts above it is scaled down to start exactly at it, as same step size passes are: every
+    step shrinks by the same factor and none is longer than the scheduler's. ddim_uniform takes
+    every (1000 // length)th of the model's timesteps, so it has only about 1000 / steps distinct
+    tails (50 steps: 0.467 for lengths 251 to 333, 0.357 for 334 to 500); karras, exponential
+    and kl_optimal take coarse steps near full noise or with few steps. A scaled tail matches no
+    denoise setting: `denoise` is then the fractional length's, and `exact` is False.
+
     A scheduler that picks from the model's 1000 timesteps (simple, beta, ddim_uniform) has few
     distinct sigmas at low noise (on MOSS about 48 below 0.2), and no length gives more. A NOISE_LEVEL
     pass that cannot cut `steps` distinct steps below its level then takes the ones there are,
@@ -206,6 +219,7 @@ def build_schedule(model_patcher, scheduler, steps, value, mode=NOISE_LEVEL):
     flow = is_flow(model_sampling)
     steps = int(steps)
     value = float(value)
+    scaled = None  # the fractional schedule length of a tail scaled down to start at the level
 
     if mode == DENOISE:
         sigmas = drop_repeats(upscale.build_sigmas(model_patcher, scheduler, steps, value))
@@ -253,6 +267,16 @@ def build_schedule(model_patcher, scheduler, steps, value, mode=NOISE_LEVEL):
         longest = steps * MAX_TOTAL_FACTOR
         n = solve_total(start, steps, target, longest, guess)
         sigmas, fewer = full(n)[-(steps + 1):], None
+        if n < longest and abs(sigma_to_level(float(sigmas[0]), flow) - value) > LEVEL_TOLERANCE:
+            # No length starts near the level. The search ends on a crossing, start(lo) > target
+            # >= start(lo + 1), so lo is n or n - 1 (n == steps when the level is above the full
+            # schedule's start, which is left as it is). Scale lo's tail down to the level.
+            lo = n if float(sigmas[0]) > target else n - 1
+            a = start(lo)
+            if lo >= steps and math.isfinite(a) and a > target:
+                b = start(lo + 1)
+                n, sigmas = lo, full(lo)[-(steps + 1):] * (target / a)
+                scaled = lo + ((a - target) / (a - b) if math.isfinite(b) and a > b else 0.0)
         if float(sigmas[0]) > target and n == longest:
             # No length has `steps` distinct sigmas from the level down, so the start lands above
             # it. The longest schedule's tail from the sigma nearest the level has fewer steps and
@@ -271,7 +295,8 @@ def build_schedule(model_patcher, scheduler, steps, value, mode=NOISE_LEVEL):
             # BasicScheduler's denoise for length n. Its own count of what the scheduler returns
             # does not matter: beta and ddim_uniform return fewer than n (232 for 233, say), and
             # steps / 232 would make BasicScheduler ask for 232 and start elsewhere.
-            total, denoise = n, basic_denoise(steps, n)
+            # A scaled tail gets the denoise of its fractional length, which no setting reproduces.
+            total, denoise = n, (basic_denoise(steps, n) if scaled is None else steps / scaled)
         else:
             # The share of the schedule the fewer steps were cut from, repeats dropped; no
             # denoise setting gives these sigmas, since BasicScheduler keeps `steps` of them.
@@ -281,7 +306,7 @@ def build_schedule(model_patcher, scheduler, steps, value, mode=NOISE_LEVEL):
     if sigmas.numel() < 2:
         return Schedule(mode, value, sigmas, 0, 0.0, 0.0, 0.0)
     first = float(sigmas[0])
-    exact = mode == DENOISE or is_basic(raw, sigmas, denoise)
+    exact = mode == DENOISE or (scaled is None and is_basic(raw, sigmas, denoise))
     return Schedule(mode, value, sigmas, total, first, sigma_to_level(first, flow), denoise, steps, exact)
 
 
@@ -391,8 +416,9 @@ class NoiseLevelScheduler:
     RETURN_TYPES = ("SIGMAS", "STRING")
     RETURN_NAMES = ("sigmas", "info")
     OUTPUT_TOOLTIPS = (
-        "The last steps + 1 sigmas of the schedule length whose first kept sigma is nearest the noise level.",
-        "The start sigma reached and the BasicScheduler denoise that gives the same sigmas.",
+        "The last steps + 1 sigmas of the schedule length whose first kept sigma is nearest the noise level, "
+        "scaled down to start exactly at it when no length starts within 0.005.",
+        "The start sigma reached and the BasicScheduler denoise that gives the same sigmas (about the same for a scaled tail).",
     )
     SEARCH_ALIASES: ClassVar[list[str]] = ["noise level", "sigma scheduler", "start noise", "denoise by noise"]
     FUNCTION = "get_sigmas"
@@ -405,6 +431,7 @@ class NoiseLevelScheduler:
             info = "noise level 0: empty sigmas, nothing is sampled"
         else:
             info = (f"noise level {noise_level:.3f} -> start sigma {schedule.start_sigma:.4g} "
-                    f"(level {schedule.start_level:.3f}), same as denoise {schedule.denoise:.4f} "
+                    f"(level {schedule.start_level:.3f}), {'same as' if schedule.exact else 'about'} "
+                    f"denoise {schedule.denoise:.4f} "
                     f"with {scheduler}, {schedule.steps} steps")
         return (schedule.sigmas, info)
