@@ -186,7 +186,10 @@ def test_plan_invariants(w, h, factor, steps, geometry, output_size):
             sol = grid.solve_axis(g.length, cap, plan.context_anchor, plan.context_overlap, multiple=m)
             assert (sol.n, sol.base) == (g.n, g.base)
         if step.index < len(plan.steps) and factor > 1:
-            assert step.width > step.src_width and step.height > step.src_height
+            # Each axis follows its own curve: it never shrinks and never passes the canvas the
+            # last pass denoises, and may keep its length while its ideal is below the next cell.
+            assert step.width >= step.src_width and step.height >= step.src_height
+            assert step.width <= last.grid_x.length and step.height <= last.grid_y.length
             assert step.size_choice == stepwise_plan.SIZE_GRID
             # Within one grid cell of the shorter side in aspect.
             assert abs(plan.aspect_deviation(step.width, step.height)) <= m / min(step.width, step.height)
@@ -203,16 +206,33 @@ def test_plan_crop_without_a_fractional_enlargement():
 
 
 def test_plan_crop_corrects_an_intermediate_at_the_canvas_size():
-    # 1000x667 x1.02 in 3 steps: step 2 is forced up to 1024x688, the canvas of the 1020x680
-    # target, with the grid size's -0.73 % aspect. The last pass still enlarges onto the source's
-    # aspect (an enlargement, so the upscale filter) instead of cropping the stretched intermediate.
-    plan = stepwise_plan.plan_upscale(1000, 667, 1.02, 3, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.3, 0.2)
+    # 990x667 x1.03 in 3 steps: step 2 lands on 1024x688, the canvas of the 1020x687 target, with
+    # the grid size's aspect. The last pass still enlarges onto the source's aspect (an
+    # enlargement, so the upscale filter) instead of cropping the stretched intermediate.
+    plan = stepwise_plan.plan_upscale(990, 667, 1.03, 3, LatentGeometry(16, 16), 1024, 1024, 32, 32, 0.3, 0.2)
     mid, last = plan.steps[1], plan.steps[2]
     assert (mid.width, mid.height) == (last.width, last.height) == (1024, 688)
-    assert last.enlarged == pytest.approx((1000 * 688 / 667, 688.0))
+    assert last.enlarged == pytest.approx((1024.0, 1024 * 667 / 990))
     assert last.method == stepwise_plan.DEFAULT_UPSCALE_METHOD
-    assert plan.final == stepwise_plan.FinalCrop(1024, 688, 1020, 680, 2, 4)
+    assert plan.final == stepwise_plan.FinalCrop(1024, 688, 1020, 687, 2, 0)
     assert "  enlarge  1024x688 -> 1024x688" in stepwise_plan.format_plan(plan)
+
+
+@pytest.mark.parametrize("output_size", stepwise_plan.OUTPUT_SIZES)
+def test_plan_short_axis_follows_its_curve_without_passing_the_target(output_size):
+    # 1249x215 x1.69 in 11 steps on a 32 px grid: the height has fewer cells to grow (224 -> 384)
+    # than there are passes. It used to be forced a cell a pass to 512 and shrunk back on the last
+    # pass (aspect -25.8 % on step 10, found by a random plan_only sweep 2026-11-27). Now it keeps
+    # its length for a pass where its ideal has not reached the next cell, so no axis passes the
+    # last pass's canvas and the aspect stays within one grid cell of the shorter side.
+    plan = stepwise_plan.plan_upscale(1249, 215, 1.69, 11, LatentGeometry(16, 32), 1024, 608, 32, 0, 0.3, 0.2,
+                                      output_size=output_size)
+    last = plan.steps[-1]
+    for step in plan.steps[:-1]:
+        assert step.src_width <= step.width <= last.grid_x.length
+        assert step.src_height <= step.height <= last.grid_y.length
+        assert abs(plan.aspect_deviation(step.width, step.height)) <= 32 / min(step.width, step.height)
+    assert last.width >= last.src_width and last.height >= last.src_height
 
 
 def test_plan_crop_after_the_canvas_is_reached_does_not_enlarge_again():

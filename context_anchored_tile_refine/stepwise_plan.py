@@ -227,22 +227,26 @@ def _axis(length, cap, anchor, overlap, geometry, axis):
     return AxisGrid(length=padded, n=sol.n, base=sol.base, last=sol.last, overhead=sol.overhead)
 
 
-def _grid_size(ideal_w, ideal_h, src_aspect, geometry, min_w=1, min_h=1):
+def _grid_size(ideal_w, ideal_h, src_aspect, geometry, min_w=1, min_h=1, max_w=None, max_h=None):
     # The grid size near (ideal_w, ideal_h) that best trades size deviation against aspect
-    # deviation, each axis at least its minimum.
+    # deviation, each axis at least its minimum and at most its maximum (a grid length at or
+    # above the minimum, or None for no maximum).
     m = geometry.multiple
 
-    def lengths(ideal, low):
+    def lengths(ideal, low, high):
         centre = round(ideal / m)
         first = max(1, -(-low // m), centre - SEARCH_CELLS)
-        return range(first * m, (max(first, centre) + SEARCH_CELLS) * m + 1, m)
+        last = max(first, centre) + SEARCH_CELLS
+        if high is not None:
+            first, last = min(first, high // m), min(last, high // m)
+        return range(first * m, last * m + 1, m)
 
     def cost(size):
         w, h = size
         aspect = abs(math.log((w / h) / src_aspect))
         return abs(math.log(w / ideal_w)) + abs(math.log(h / ideal_h)) + ASPECT_WEIGHT * aspect, w * h
 
-    return min(((w, h) for w in lengths(ideal_w, min_w) for h in lengths(ideal_h, min_h)), key=cost)
+    return min(((w, h) for w in lengths(ideal_w, min_w, max_w) for h in lengths(ideal_h, min_h, max_h)), key=cost)
 
 
 def _crop_canvas(src_w, src_h, target_w, target_h, geometry):
@@ -331,6 +335,18 @@ def plan_upscale(src_width, src_height, factor, steps, geometry, cap_width, cap_
             f"image is enlarged {_factors(ew / src_width, eh / src_height)} and cropped back, which softens it "
             f"slightly. output_size \"{OUTPUT_PAD}\" avoids the resample and keeps every edge pixel.")
 
+    # Each axis follows its own even curve towards the last pass: it never shrinks, never passes
+    # the canvas the last pass denoises (its size, padded onto the grid when that is off it), and
+    # keeps its length for a pass when its ideal has not reached the next grid cell. An axis with
+    # fewer cells to grow than there are passes used to be forced a cell a pass, past the target,
+    # and shrunk back on the last pass (aspect off by up to 26 % between).
+    if plain:
+        last_w, last_h = canvas_w, canvas_h
+    else:
+        last_w, last_h = _grid_size(src_width * factor * oversample, src_height * factor * oversample,
+                                    src_aspect, geometry)
+    max_w, max_h = geometry.round_up(last_w), geometry.round_up(last_h)
+
     plan_steps = []
     prev_w, prev_h = src_width, src_height
     landed = False   # the previous pass already sampled the target's canvas
@@ -350,7 +366,8 @@ def plan_upscale(src_width, src_height, factor, steps, geometry, cap_width, cap_
             # previous size exactly, since a near-identity resample would only soften it.
             width, height, choice = prev_w, prev_h, SIZE_SAME
         else:
-            width, height = _grid_size(ideal_w, ideal_h, src_aspect, geometry, prev_w + 1, prev_h + 1)
+            width, height = _grid_size(ideal_w, ideal_h, src_aspect, geometry, min(prev_w, max_w),
+                                       min(prev_h, max_h), max_w, max_h)
             choice = SIZE_GRID
         gx = _axis(width, cap_width, anchor, overlap, geometry, "width")
         gy = _axis(height, cap_height, anchor, overlap, geometry, "height")
