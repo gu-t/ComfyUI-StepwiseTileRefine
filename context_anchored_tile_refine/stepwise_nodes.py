@@ -113,6 +113,7 @@ class TileRefineAnyVAE(ContextAnchoredTileRefine):
                 **_tile_inputs({name: req[name] for name in ("max_tile_width", "max_tile_height")}),
             },
             "optional": {**up.get("optional", {}), **_latent_geometry_inputs(), **_preview_inputs()},
+            "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
     @classmethod
@@ -123,14 +124,14 @@ class TileRefineAnyVAE(ContextAnchoredTileRefine):
     SEARCH_ALIASES: ClassVar[list[str]] = ["tiled refine", "tile refine", "any vae", "moss", "flux2", "16x vae"]
     DESCRIPTION = "Refines an already upscaled image tile by tile. Works with any VAE latent scale (8x, 16x, ...)."
 
-    def refine(self, image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, tile_padding, tile_overlap, mask=None, latent_scale=0, pixel_multiple=0, tile_mode=TILE_BY_TILE, tile_size=SIZE_FULL, preview_mode=GUESS):
+    def refine(self, image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, tile_padding, tile_overlap, mask=None, latent_scale=0, pixel_multiple=0, tile_mode=TILE_BY_TILE, tile_size=SIZE_FULL, preview_mode=GUESS, unique_id=None):
         _validate_image(image)
         message = check_tiles(max_tile_width, max_tile_height, tile_padding, tile_overlap)
         if message is not True:
             raise ValueError(message)
         if mask is not None:
             mask = _normalize_mask(mask, image)
-        from . import grid, sampling
+        from . import grid, run_progress, sampling
 
         geometry = resolve_run_geometry(vae, latent_scale, pixel_multiple)
         height, width = int(image.shape[1]), int(image.shape[2])
@@ -139,8 +140,11 @@ class TileRefineAnyVAE(ContextAnchoredTileRefine):
                 "Tile Refine (Any VAE): the image is %dx%d, off the %d px grid, so its right and bottom edges are "
                 "padded with a mirrored strip during denoise. The model may misread the outermost pixels. Feed a "
                 "size that is a multiple of %d px to avoid it.", width, height, geometry.multiple, geometry.multiple)
+        # One bar over every picture of the batch, in sampler steps (drawn finer, run_progress).
+        weight = max(0, sigmas.shape[-1] - 1) * int(image.shape[0])
         try:
-            return (sampling.refine_image(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, tile_padding, tile_overlap, mask=mask, geometry=geometry, tile_mode=tile_mode, tile_size=tile_size, preview_mode=preview_mode),)
+            with run_progress.RunProgress([weight], unique_id) as run:
+                return (sampling.refine_image(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, tile_padding, tile_overlap, mask=mask, geometry=geometry, tile_mode=tile_mode, tile_size=tile_size, preview_mode=preview_mode, bar=run.part(0)),)
         except grid.GridConfigError as e:
             raise ValueError(_widget_names(str(e))) from e
 
@@ -161,15 +165,16 @@ def check_tiles(max_tile_width=None, max_tile_height=None, tile_padding=None, ti
     return True
 
 
-def enlarge(image, width, height, upscale_model=None, method="lanczos", virtual=None):
+def enlarge(image, width, height, upscale_model=None, method="lanczos", virtual=None, bar=None):
     # Pixel-space resample of the whole image to exactly width x height: the optional upscale
     # model first, then one resample onto the exact size with `method` (resample.py), or onto
-    # the centre of the fractional size `virtual`. A same-size resample is skipped.
+    # the centre of the fractional size `virtual`. A same-size resample is skipped. `bar`
+    # (run_progress.Part) is where the upscale model reports.
     from . import resample, upscale
 
     current = image
     if upscale_model is not None:
-        current = upscale._upscale_with_model(upscale_model, current)
+        current = upscale._upscale_with_model(upscale_model, current, bar=bar)
     return resample.resize(current, width, height, method, virtual)
 
 
@@ -195,6 +200,36 @@ def step_noise(noise, index):
     shifted = copy.copy(noise)
     shifted.seed = (noise.seed + index - 1) % (1 << 64)
     return shifted
+
+
+def run_bars(plan, schedules, shifting=None, pictures=1, upscale_model=None, node_id=None):
+    """The run's one bar (run_progress.RunProgress) and, per plan step, (upscale model part or None,
+    refine part). A refine part weighs what the plan text counts: tiles (the shifting grid's mean
+    windows per call) x sampler steps, times the pictures. The upscale model weighs its tiled_scale
+    tiles at run_progress.UPSCALE_TILE_WEIGHT tile steps each."""
+    import comfy.utils
+
+    from . import run_progress, upscale
+
+    n = len(plan.steps)
+    weights, slots = [], []
+    for i, (step, schedule) in enumerate(zip(plan.steps, schedules, strict=True)):
+        model_slot = None
+        if step.use_model and upscale_model is not None:
+            tiles = comfy.utils.get_tiled_scale_steps(step.src_width, step.src_height, upscale.MODEL_TILE,
+                                                     upscale.MODEL_TILE, upscale.MODEL_TILE_OVERLAP)
+            model_slot = len(weights)
+            weights.append(run_progress.UPSCALE_TILE_WEIGHT * tiles * pictures)
+        units = step.tiles if shifting is None else sum(shifting.windows[i]) / 2
+        slots.append((model_slot, len(weights)))
+        weights.append(units * schedule.steps * pictures)
+    run = run_progress.RunProgress(weights, node_id)
+    parts = []
+    for step, (model_slot, refine_slot) in zip(plan.steps, slots, strict=True):
+        label = f"step {step.index}/{n}"
+        model_part = None if model_slot is None else run.part(model_slot, label)
+        parts.append((model_part, run.part(refine_slot, label)))
+    return run, parts
 
 
 class StepwiseTileUpscale:
@@ -244,6 +279,7 @@ class StepwiseTileUpscale:
                 **_latent_geometry_inputs(),
                 **_preview_inputs(),
             },
+            "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
     RETURN_TYPES = ("IMAGE", "IMAGE", "STRING")
@@ -297,7 +333,7 @@ class StepwiseTileUpscale:
                 denoise_mode=NOISE_LEVEL, oversample=1.0, oversample_mode=OVERSAMPLE_CONSTANT,
                 upscale_method=DEFAULT_UPSCALE_METHOD, downscale_method=DEFAULT_DOWNSCALE_METHOD,
                 tile_mode=TILE_BY_TILE, tile_size=SIZE_FULL, preview_mode=GUESS, output_size=DEFAULT_OUTPUT_SIZE,
-                steps_mode=SAME_STEP_SIZE):
+                steps_mode=SAME_STEP_SIZE, unique_id=None):
         _validate_image(image)
         message = check_tiles(max_tile_width, max_tile_height, tile_padding, tile_overlap, auto=True)
         if message is not True:
@@ -330,23 +366,26 @@ class StepwiseTileUpscale:
 
         current = image[..., :3] if image.shape[-1] > 3 else image
         results = []
-        for step, schedule in zip(plan.steps, schedules, strict=True):
-            comfy.model_management.throw_exception_if_processing_interrupted()
-            logging.info("Stepwise Tile Upscale: step %d/%d, %dx%d -> %dx%d, start noise %.3f (denoise %.4f), %d steps, %d tiles",
-                         step.index, len(plan.steps), step.src_width, step.src_height, step.width, step.height,
-                         schedule.start_level, schedule.denoise, schedule.steps, step.tiles)
-            current = enlarge(current, step.width, step.height, upscale_model if step.use_model else None, step.method,
-                              step.enlarged if step.enlarge_width else None)
-            current = sampling.refine_image(
-                current, guider, sampler, schedule.sigmas, vae, step_noise(noise, step.index), plan.cap_width,
-                plan.cap_height, tile_padding if tile_mode == all_at_once.SHIFTING else plan.context_anchor, plan.context_overlap,
-                geometry=plan.geometry, tile_mode=tile_mode, tile_size=tile_size, preview_mode=preview_mode)
-            current = current.to(comfy.model_management.intermediate_device())
-            if (int(current.shape[2]), int(current.shape[1])) != (step.width, step.height):
-                raise RuntimeError(
-                    f"Stepwise Tile Upscale: step {step.index} produced {int(current.shape[2])}x{int(current.shape[1])}, "
-                    f"expected {step.width}x{step.height}")
-            results.append(current)
+        run, parts = run_bars(plan, schedules, shifting, int(image.shape[0]), upscale_model, unique_id)
+        with run:
+            for step, schedule, (model_bar, refine_bar) in zip(plan.steps, schedules, parts, strict=True):
+                comfy.model_management.throw_exception_if_processing_interrupted()
+                logging.info("Stepwise Tile Upscale: step %d/%d, %dx%d -> %dx%d, start noise %.3f (denoise %.4f), %d steps, %d tiles",
+                             step.index, len(plan.steps), step.src_width, step.src_height, step.width, step.height,
+                             schedule.start_level, schedule.denoise, schedule.steps, step.tiles)
+                current = enlarge(current, step.width, step.height, upscale_model if step.use_model else None,
+                                  step.method, step.enlarged if step.enlarge_width else None, bar=model_bar)
+                current = sampling.refine_image(
+                    current, guider, sampler, schedule.sigmas, vae, step_noise(noise, step.index), plan.cap_width,
+                    plan.cap_height, tile_padding if tile_mode == all_at_once.SHIFTING else plan.context_anchor,
+                    plan.context_overlap, geometry=plan.geometry, tile_mode=tile_mode, tile_size=tile_size,
+                    preview_mode=preview_mode, bar=refine_bar)
+                current = current.to(comfy.model_management.intermediate_device())
+                if (int(current.shape[2]), int(current.shape[1])) != (step.width, step.height):
+                    raise RuntimeError(
+                        f"Stepwise Tile Upscale: step {step.index} produced {int(current.shape[2])}x{int(current.shape[1])}, "
+                        f"expected {step.width}x{step.height}")
+                results.append(current)
         if isinstance(plan.final, stepwise_plan.FinalCrop):
             # A crop is no pass of its own: the last step's image is shown cropped.
             current = final_crop(current, plan.final)

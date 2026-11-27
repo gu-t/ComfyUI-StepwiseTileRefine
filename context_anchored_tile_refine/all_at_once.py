@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 import torch
 
 from . import grid
+from .run_progress import picture_prefix
 
 TILE_BY_TILE = "tile by tile"
 ALL_AT_ONCE = "all at once"
@@ -366,11 +367,12 @@ def fixed_layout(canvas_w, canvas_h, max_tile_width, max_tile_height, context_an
 
 def refine_all_at_once(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor,
                        context_overlap, geometry, tile_mode=SHIFTING, tile_size=SIZE_FULL, batch_size=1, batch_index=0,
-                       log=None, preview_mode=None):
+                       log=None, preview_mode=None, bar=None):
     """One picture through an all at once mode: encode the whole canvas (core's VAE call, which
     tiles itself when its estimate or an OOM says so), sample it as one run with the tiling
     wrapper, decode the whole canvas, crop back. For the shifting grid context_anchor is the ring
-    as given; for the fixed grid both rings are already snapped (geometry.snap_rings)."""
+    as given; for the fixed grid both rings are already snapped (geometry.snap_rings). `bar`
+    (run_progress.Part) is the run's bar, shared by every picture of the batch."""
     import comfy.model_management
 
     from . import sampling
@@ -422,7 +424,8 @@ def refine_all_at_once(image, guider, sampler, sigmas, vae, noise, max_tile_widt
     run_guider = wrapped_guider(guider, wrapper)
     with tile_memory_estimate(guider, cap_h, cap_w):
         samples = sampling.sample_latent(run_guider, sampler, sigmas, canvas_noise, seed, latent,
-                                         callback=_guarded_callback(guider, sigmas, wrapper))
+                                         callback=_guarded_callback(guider, sigmas, wrapper, bar, batch_size,
+                                                                    batch_index))
     _require_wrapper_used(wrapper)
     decoded = sampling.fold_decoded_frames(vae.decode(samples))
     decoded = decoded.to(comfy.model_management.intermediate_device())
@@ -440,15 +443,17 @@ def _require_wrapper_used(wrapper):
             "core's guiders do). Use tile by tile with this guider.")
 
 
-def _guarded_callback(guider, sigmas, wrapper):
+def _guarded_callback(guider, sigmas, wrapper, bar=None, batch_size=1, batch_index=0):
     # The sampler's per-step callback (core's latent preview) with the wrapper check after the first
     # step, so a guider that bypasses the wrapper stops after one step instead of at the end.
     # With a preview_mode hub on the wrapper the callback keeps its own progress bar, so the
     # wrapper's per-window previews (one tile at a time) land on the step the run is at.
+    # With a run bar (run_progress.Part) every step reports there instead, this picture's steps
+    # after the batch's earlier pictures, and names itself on the status line.
     import latent_preview
 
     steps = sigmas.shape[-1] - 1
-    if wrapper.hub is None:
+    if wrapper.hub is None and bar is None:
         core_preview = latent_preview.prepare_callback(guider.model_patcher, steps)
 
         def callback(step, x0, x, total_steps):
@@ -459,14 +464,33 @@ def _guarded_callback(guider, sigmas, wrapper):
 
     import comfy.utils
 
-    pbar = comfy.utils.ProgressBar(steps)
+    if bar is None:
+        pbar, offset, total = comfy.utils.ProgressBar(steps), 0, steps
+    else:
+        pbar, offset, total = bar, steps * batch_index, steps * batch_size
+    if wrapper.hub is None:
+        # Core's x0 preview (latent_preview.prepare_callback), onto the run bar.
+        previewer = latent_preview.get_previewer(guider.model_patcher.load_device,
+                                                 guider.model_patcher.model.latent_format)
+
+        def shown(x0, x):
+            if previewer is None:
+                return None
+            if x0.is_nested:
+                x0 = x0.tensors[0]
+            return previewer.decode_latent_to_preview_image("JPEG", x0)
+    else:
+        shown = wrapper.hub.canvas_step
     at = {"step": 0}
-    wrapper.emit = lambda shown: pbar.update_absolute(at["step"], steps, shown)
+    wrapper.emit = lambda image: pbar.update_absolute(offset + at["step"], total, image)
+    prefix = picture_prefix(batch_size, batch_index)
 
     def callback(step, x0, x, total_steps):
         _require_wrapper_used(wrapper)
         at["step"] = step + 1
-        pbar.update_absolute(step + 1, total_steps, wrapper.hub.canvas_step(x0, x))
+        if bar is not None:
+            bar.note(f"{prefix}sampler step {step + 1}/{steps}")
+        pbar.update_absolute(offset + step + 1, total, shown(x0, x))
 
     return callback
 

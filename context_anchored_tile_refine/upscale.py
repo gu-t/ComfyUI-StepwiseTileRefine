@@ -71,7 +71,7 @@ def _lanczos_resize(image, width, height):
     return resized.movedim(1, -1)
 
 
-def _upscale_with_model(upscale_model, image, progress=None):
+def _upscale_with_model(upscale_model, image, progress=None, bar=None):
     # comfy_extras/nodes_upscale_model.py ImageUpscaleWithModel.execute, alpha split included
     # (the model takes RGB only), with model residency made version-defensive: pyproject only
     # requires ComfyUI >= 0.3.45, and the UPSCALE_MODEL object gained its `.patcher` after that
@@ -79,6 +79,8 @@ def _upscale_with_model(upscale_model, image, progress=None):
     # and eviction. WITHOUT one (the older loader) the pre-patcher contract applies: reserve
     # the memory by hand, move the module onto the device, and move it back off in `finally`
     # so a raise cannot strand it on the GPU.
+    # bar (run_progress.Part) is the fork nodes' run bar, which the model's tiles report on
+    # instead of a bar of their own.
     import comfy.model_management
     import comfy.utils
 
@@ -125,7 +127,13 @@ def _upscale_with_model(upscale_model, image, progress=None):
                 # routes into that segment instead of resetting the display.
                 if progress is not None:
                     progress.resize(steps * W_UPSCALE_STEP)
-                pbar = comfy.utils.ProgressBar(steps)
+                if bar is None:
+                    pbar = comfy.utils.ProgressBar(steps)
+                else:
+                    # A retry starts the part over at its new size; the run bar holds until it passes.
+                    pbar = bar
+                    pbar.update_absolute(0, steps)
+                    pbar.note("upscale model")
                 upscaled = comfy.utils.tiled_scale(in_img, lambda a: upscale_model(a.float()), tile_x=tile, tile_y=tile, overlap=MODEL_TILE_OVERLAP, upscale_amount=upscale_model.scale, pbar=pbar, output_device=output_device)
                 oom = False
             except Exception as error:

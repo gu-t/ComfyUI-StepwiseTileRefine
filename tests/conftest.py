@@ -220,6 +220,10 @@ def comfy_stubs(monkeypatch):
         def update_absolute(self, value, total=None, preview=None):
             self.updates.append((value, total, preview))
 
+        def update(self, value):
+            # Core's: relative to the last value (tiled_scale ticks one tile at a time).
+            self.update_absolute((self.updates[-1][0] if self.updates else 0) + value, self.total)
+
     utils_module.ProgressBar = RecordingProgressBar
 
     def common_upscale(samples, width, height, upscale_method, crop):
