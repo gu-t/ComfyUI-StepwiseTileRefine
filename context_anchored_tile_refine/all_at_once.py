@@ -245,7 +245,7 @@ class TiledModelWrapper:
         self.check_interrupt = check_interrupt
         self.calls = 0
         # preview_mode (preview.py): the hub sees every window's cond answer, and `emit` sends what
-        # it renders. Both None by default. `on_window(index, count, device, cond_or_uncond)` runs
+        # it renders. Both None by default. `on_window(index, count, cond_or_uncond)` runs
         # before every window, for the run bar's status line.
         self.hub = hub
         self.emit = None
@@ -266,7 +266,7 @@ class TiledModelWrapper:
             if self.check_interrupt is not None:
                 self.check_interrupt()
             if self.on_window is not None:
-                self.on_window(index, len(windows), x.device, args.get("cond_or_uncond"))
+                self.on_window(index, len(windows), args.get("cond_or_uncond"))
             ys, xs = slice(win.y0, win.y1), slice(win.x0, win.x1)
             tile_c = {key: _slice_spatial(value, height, width, ys, xs) for key, value in c.items()}
             tile_x = x[..., ys, xs]
@@ -492,12 +492,9 @@ def _guarded_callback(guider, sigmas, wrapper, bar=None, batch_size=1, batch_ind
     if bar is not None:
         prefix = picture_prefix(batch_size, batch_index)
 
-        def on_window(index, count, device, cond_or_uncond):
-            # Python queues a window's work on the device and moves on. Without a wait the line names
-            # windows the device has not reached, and the wait lands on a later one. The fixed grid
-            # waited only by accident (its blend weights are copied to the device per window), the
-            # shifting grid not at all.
-            _wait_for(device)
+        def on_window(index, count, cond_or_uncond):
+            # The line names the window Python is queueing, which can run ahead of the device: nothing
+            # waits for it here, since a wait per window would stall the device between windows.
             prompt = _prompt_word(cond_or_uncond)
             bar.note(f"{prefix}step {min(at['step'] + 1, steps)}/{steps} · {prompt}tile {index + 1}/{count}")
 
@@ -521,12 +518,6 @@ def _prompt_word(cond_or_uncond):
     if kinds == {1}:
         return "neg · "
     return ""
-
-
-def _wait_for(device):
-    # Until the device has run everything queued on it. Nothing to wait for on the CPU.
-    if device.type != "cpu" and torch.accelerator.is_available():
-        torch.accelerator.synchronize(device)
 
 
 # --- the Stepwise plan --------------------------------------------------------------------------

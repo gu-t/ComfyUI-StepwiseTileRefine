@@ -128,6 +128,11 @@ def test_the_status_is_sent_once_per_change_and_ends_with_the_outcome(comfy_stub
     assert status[-1][0].startswith("done in ") and {n for _, n in status} == {"7"}
     with pytest.raises(RuntimeError), run_progress.RunProgress([10], node_id="7"):
         raise RuntimeError("boom")
+    assert status[-1] == ("failed", "7")
+    import comfy.model_management
+
+    with pytest.raises(comfy.model_management.InterruptProcessingException), run_progress.RunProgress([10], node_id="7"):
+        raise comfy.model_management.InterruptProcessingException()
     assert status[-1] == ("stopped", "7")
 
 
@@ -276,27 +281,17 @@ def test_guarded_callback_without_a_bar_or_hub_is_cores(comfy_stubs):
 
 
 @pytest.mark.parametrize("tile_mode", [ALL_AT_ONCE, SHIFTING])
-def test_the_status_line_waits_for_the_device_before_every_tile(comfy_stubs, status, monkeypatch, tile_mode):
-    # Python queues a window's work and moves on, so the line waits for the device before it names
-    # the next tile; without a run bar nothing waits.
-    events = []
-    monkeypatch.setattr(all_at_once, "_wait_for", lambda device: events.append(("wait", device.type)))
-    monkeypatch.setattr(run_progress, "send_status", lambda node_id, text: events.append(("note", text)))
+def test_the_status_line_names_every_tile_and_only_with_a_run_bar(comfy_stubs, monkeypatch, tile_mode):
+    notes = []
+    monkeypatch.setattr(run_progress, "send_status", lambda node_id, text: notes.append(text))
     guider = WrapperGuider()
     TileRefineAnyVAE().refine(_smooth_image(600, 744), guider, object(), SIGMAS, ScaleVAE(16, 128), ZeroNoise(),
                               256, 256, 16, 32, tile_mode=tile_mode, unique_id="3")
-    tiles = [i for i, e in enumerate(events) if e[0] == "note" and " · tile " in e[1]]
-    assert tiles and len(guider.tile_sizes) == sum(1 for e in events if e[0] == "wait")
-    assert all(events[i - 1] == ("wait", "cpu") for i in tiles)
-    assert events[0] == ("wait", "cpu")
-    events.clear()
+    assert len(guider.tile_sizes) == sum(1 for t in notes if " · tile " in t)
+    notes.clear()
     sampling.refine_image(_smooth_image(600, 744), WrapperGuider(), object(), SIGMAS, ScaleVAE(16, 128), ZeroNoise(),
                           256, 256, 16, 32, tile_mode=tile_mode)
-    assert events == []
-
-
-def test_waiting_for_the_cpu_is_a_no_op():
-    all_at_once._wait_for(torch.device("cpu"))
+    assert notes == []
 
 
 @pytest.mark.parametrize("chunks, word", [([0], "pos · "), ([1], "neg · "), ([0, 1], ""), ([1, 0], ""), ([0, 0], "pos · "),

@@ -35,7 +35,7 @@ def send_status(node_id, text):
 class RunProgress:
     """The bar of one node run. `weights` are the parts' shares, in run order (0 for a part that
     does no work); `node_id` is the node's UNIQUE_ID, for the status line. Use it as a context
-    manager: leaving it fills the bar and says how the run ended."""
+    manager: leaving it fills the bar and says how the run ended (done, stopped by the user, or failed)."""
 
     def __init__(self, weights, node_id=None):
         weights = [max(0, math.ceil(w)) for w in weights]
@@ -91,7 +91,10 @@ class RunProgress:
             self.finish()
             self.say(f"done in {time.perf_counter() - self._started:.1f} s")
         else:
-            self.say("stopped")
+            import comfy.model_management
+
+            interrupted = issubclass(exc_type, comfy.model_management.InterruptProcessingException)
+            self.say("stopped" if interrupted else "failed")
         return False
 
 
