@@ -74,9 +74,14 @@ def _preview_inputs():
 
 def _widget_names(message):
     # Upstream's checks name the engine's arguments. The fork's nodes call them tile_padding and
-    # tile_overlap.
+    # tile_overlap. A grid.GridConfigError with an axis leads with the solver's internal symbols
+    # ("caps too small ...: L=480 cap=416 ctx=128 ... reason=exhausted)") before the sentence in
+    # widget names; the node shows only that sentence (the full text stays on the chained error).
     if not isinstance(message, str):
         return message
+    head, sep, widgets = message.partition(". max_tile_")
+    if sep and head.startswith("caps too small"):
+        message = "max_tile_" + widgets
     return message.replace("context_anchor", "tile_padding").replace("context_overlap", "tile_overlap")
 
 
@@ -210,7 +215,7 @@ class StepwiseTileUpscale:
                 "vae": ("VAE", {"tooltip": "The VAE that encodes and decodes each tile. Its latent scale is read automatically."}),
                 # Size: how big the output gets and in how many passes.
                 "upscale_by": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 16.0, "step": 0.01, "tooltip": "Output size: the final image is round(input x upscale_by) on each axis (output_size says how it lands there). 1 keeps the input size (a pure repair run with oversample)."}),
-                "output_size": (list(OUTPUT_SIZES), {"default": DEFAULT_OUTPUT_SIZE, "tooltip": "How the output lands on round(input x upscale_by) when that is not a multiple of the pixel grid (16 px for MOSS). Every step before it is always on the grid. exact, crop edges: the last step runs a few px larger without stretching and is centre-cropped, so a few px of picture are lost at the edges. exact, pad edges during denoise: the right and bottom edges are padded with a mirrored strip while the last step denoises and cut off after; nothing mirrored is left in the image, but the model may misread the outermost pixels. stretch image: the output is the grid size nearest the target, each axis a few px larger or smaller, so the aspect changes slightly; the plan says by how much. With oversample the final resample hits the exact size, so only stretch image changes anything there."}),
+                "output_size": (list(OUTPUT_SIZES), {"default": DEFAULT_OUTPUT_SIZE, "tooltip": "How the output lands on round(input x upscale_by) when that is not a multiple of the pixel grid (16 px for MOSS). Every step before it is always on the grid. exact, crop edges: the last step runs a few px larger without stretching and is centre-cropped, so a few px of picture are lost at the edges. exact, pad edges during denoise: the right and bottom edges are padded with a mirrored strip while the last step denoises and cut off after; nothing mirrored is left in the image, but the model may misread the outermost pixels. stretch image: the output is a grid size near the target, chosen to keep the aspect: the rounding of the shorter axis is matched on the longer one, so both are off by about the same percentage (2147x344 becomes 2208x352 on a 32 px grid, +2.8 % and +2.3 %) and the aspect changes only slightly; the plan says by how much. With oversample the final resample hits the exact size, so only stretch image changes anything there."}),
                 "upscale_steps": ("INT", {"default": 0, "min": 0, "max": 16, "tooltip": "Number of refine passes. 0 picks the fewest whose growth per pass is at most auto_step_factor."}),
                 "auto_step_factor": ("FLOAT", {"default": 1.5, "min": 1.05, "max": 8.0, "step": 0.05, "tooltip": "Largest growth per pass when upscale_steps is 0 (auto). Unused when upscale_steps is set."}),
                 "oversample": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 8.0, "step": 0.01, "tooltip": "Runs the refine passes this much larger than the output track, then shrinks onto the exact output size after the last pass. The largest pass is input x upscale_by x oversample. Enlarging makes small objects bigger in pixels, so the passes can redraw them. 1 is off."}),

@@ -499,6 +499,18 @@ def test_stepwise_node_output_size(comfy_stubs, output_size, size):
     assert ("mirrored" in text) == (output_size == stepwise_plan.OUTPUT_PAD)
 
 
+def test_stepwise_grid_error_shows_only_the_widget_sentence(comfy_stubs):
+    # 160x120 x3 is 480x360: a 256 px tile cannot hold 128 + 96 px rings on both sides. The node
+    # shows the sentence in its own widget names, without the solver's internal symbols (L=,
+    # cap=, reason=), which stay on the chained GridConfigError.
+    with pytest.raises(ValueError) as excinfo:
+        StepwiseTileUpscale().upscale(_smooth_image(120, 160), _stepwise_guider(), object(), ZeroNoise(),
+                                      ScaleVAE(16, 128), "simple", 4, 3.0, 1, 256, 256, 128, 96, 0.3, 0.3, True)
+    assert str(excinfo.value) == ("max_tile_width 256 cannot hold tile_padding 128 + tile_overlap 96 on both "
+                                  "sides. Raise max_tile_width or lower tile_overlap.")
+    assert "reason=" in str(excinfo.value.__cause__)
+
+
 def test_stepwise_plan_only_samples_nothing(comfy_stubs):
     vae = ScaleVAE(16, 128)
     image = _smooth_image(120, 160)

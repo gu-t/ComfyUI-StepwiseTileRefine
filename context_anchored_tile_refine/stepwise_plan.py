@@ -17,8 +17,12 @@ it, `output_size` says how:
                                      a few px of picture are lost at the edges
     exact, pad edges during denoise  the last pass samples the target, reflect-padded to the grid
                                      and cropped back
-    stretch image                    the output is the grid size nearest the target, so the
-                                     aspect changes slightly (the plan warns by how much)
+    stretch image                    the output is a grid size near the target that keeps the
+                                     aspect (_grid_size): the shorter axis's rounding is matched
+                                     on the longer one, so both are off by about the same
+                                     percentage, many px on a long axis (2147x344 -> 2208x352 on
+                                     32 px), and the aspect changes only slightly (the plan
+                                     warns by how much)
 
 With oversample the last pass is not the target, and the final resample reaches it exactly.
 
