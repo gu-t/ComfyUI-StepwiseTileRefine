@@ -200,7 +200,8 @@ def step_noise(noise, index):
 class StepwiseTileUpscale:
     """Upscales in several steps. Each step enlarges in pixel space and runs a tile refine, with
     strength (start noise level or denoise) falling from the first step to the last. Every step
-    samples a size on the pixel grid; output_size says how the output lands on the target."""
+    samples a size on the pixel grid, and an axis with less than a grid cell to grow keeps its
+    length for a step; output_size says how the output lands on the target."""
 
     @classmethod
     def INPUT_TYPES(s):
@@ -249,7 +250,7 @@ class StepwiseTileUpscale:
     RETURN_NAMES = ("image", "step_images", "plan")
     OUTPUT_IS_LIST = (False, True, False)
     OUTPUT_TOOLTIPS = (
-        "The final image at round(input x upscale_by), or the grid size nearest it (output_size).",
+        "The final image at round(input x upscale_by), or with output_size stretch image a grid size near it that keeps the aspect.",
         "The result of every step, for inspection (a list, since the sizes differ).",
         "The plan as plain text: sizes, factors, aspect deviation, tiles and what the model sees, rings, noise and enlargement per step.",
     )

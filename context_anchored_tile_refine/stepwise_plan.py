@@ -4,10 +4,13 @@ Stdlib only (no torch, no comfy), so the whole plan is testable without a GPU or
 A step is "enlarge in pixel space, then tile refine". Every size a pass samples is a multiple of
 the pixel grid, because the VAE encodes whole latent cells and a canvas off the grid would have
 to be reflect-padded: the model takes the mirrored strip for picture and may draw something
-else from it. An intermediate takes the grid size nearest its ideal, source * factor ** (i /
-steps), weighing size against aspect deviation (_grid_size). On a 16 px grid that keeps the
-aspect within about 0.85 % and every step's factor within about 2.4 % of the even factor, worst
-cases on 0.5 MP sources; the deviation shrinks as the image grows.
+else from it. An intermediate takes a grid size near its ideal, source * factor ** (i / steps),
+weighing size against aspect deviation (_grid_size). Each axis never shrinks, never passes the
+last pass's canvas and keeps its length while its ideal is below the next grid cell, so a pass
+can refine at the same size. On a 16 px grid with automatic steps that keeps the aspect within
+about 0.9 % and every step's factor within about 2.5 % of the even factor, worst cases on 0.5 MP
+sources; with many small steps both can be off by a grid cell of the shorter side (about 1.2 %
+and 4 % there). The deviation shrinks as the image grows.
 
 The output is round(source * factor) per axis. When it is off the grid and the last pass lands on
 it, `output_size` says how:

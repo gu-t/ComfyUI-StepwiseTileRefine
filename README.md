@@ -37,7 +37,7 @@ Both nodes are wired like `SamplerCustomAdvanced`: a `GUIDER` (for example `CFGG
 
 ### Stepwise Tile Upscale
 
-Upscales in several steps. Each step enlarges the whole image in pixel space and then refines it tile by tile, with the strength (start noise level, or denoise) falling from the first step to the last.
+Upscales in several steps. Each step enlarges the whole image in pixel space and then refines it tile by tile, with the strength (start noise level, or denoise) falling from the first step to the last. An axis with less than a grid cell to grow keeps its length for a step, so with many small steps a step can refine at the same size ([How the steps are planned](#how-the-steps-are-planned)).
 
 | Input | What it does |
 |---|---|
@@ -119,7 +119,7 @@ The two `all at once` modes put the tiling inside the model call: the sampler ru
 ## How the steps are planned
 
 1. The final size is `round(source × upscale_by)`, landed on as `output_size` says.
-2. Each step enlarges by about `factor^(1/steps)`. Every intermediate size is a multiple of the pixel grid (the VAE encodes whole latent cells, so nothing is padded with a mirrored strip): the one nearest the ideal size with the least aspect deviation. On a 16 px grid the aspect stays within about 0.85 % and each step's factor within about 2.4 % of the even factor, worst cases on 0.5 MP sources. The last tile of an axis can be narrower than the others; with `tile_size` `always full` the model still sees a full window. The plan shows the factor and the aspect deviation of every step.
+2. Each step enlarges by about `factor^(1/steps)`. Every intermediate size is a multiple of the pixel grid (the VAE encodes whole latent cells, so nothing is padded with a mirrored strip): one near the ideal size that weighs size against aspect deviation. Each axis follows its own curve: it never shrinks, never passes the canvas the last step denoises, and keeps its length for a step while its ideal has not reached the next grid cell. A step where neither axis grows refines at the same size with its own seed. On a 16 px grid with automatic steps the aspect stays within about 0.9 % and each step's factor within about 2.5 % of the even factor, worst cases on 0.5 MP sources. With many small steps both can be off by up to a grid cell of the shorter side (about 1.2 % and 4 % there). The last tile of an axis can be narrower than the others; with `tile_size` `always full` the model still sees a full window. The plan shows the factor and the aspect deviation of every step.
 3. Tiles are never resampled. A tile is cut from the canvas, sampled and pasted back at its native size.
 4. The strength goes linearly per step from `denoise_first` to `denoise_last`, as a noise level or a `BasicScheduler` denoise (`denoise_mode`).
 
