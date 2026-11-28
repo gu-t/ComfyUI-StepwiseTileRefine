@@ -32,6 +32,7 @@ class ScaleVAE:
         self.require = require or scale
         self.encode_shapes = []
         self.tiled_decodes = []
+        self.tiled_encodes = []
 
     def spacial_compression_encode(self):
         return self.scale
@@ -58,6 +59,10 @@ class ScaleVAE:
         # Position-preserving, so a tiled decode equals the plain one; the bounds are recorded.
         self.tiled_decodes.append((tile_x, tile_y, overlap))
         return self.decode(samples)
+
+    def encode_tiled(self, pixels, tile_x=None, tile_y=None, overlap=None):
+        self.tiled_encodes.append((tile_x, tile_y, overlap))
+        return self.encode(pixels)
 
 
 class CheckingGuider(GridGuider):

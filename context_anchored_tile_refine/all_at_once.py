@@ -372,9 +372,8 @@ def fixed_layout(canvas_w, canvas_h, max_tile_width, max_tile_height, context_an
 def refine_all_at_once(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor,
                        context_overlap, geometry, tile_mode=SHIFTING, tile_size=SIZE_FULL, batch_size=1, batch_index=0,
                        log=None, preview_mode=None, bar=None):
-    """One picture through an all at once mode: encode the whole canvas (core's VAE call, which
-    tiles itself when its estimate or an OOM says so), sample it as one run with the tiling
-    wrapper, decode the whole canvas, crop back. For the shifting grid context_anchor is the ring
+    """One picture through an all at once mode: encode the whole canvas tiled at the window size,
+    sample it as one run with the tiling wrapper, decode the whole canvas tiled, crop back. For the shifting grid context_anchor is the ring
     as given; for the fixed grid both rings are already snapped (geometry.snap_rings). `bar`
     (run_progress.Part) is the run's bar, shared by every picture of the batch."""
     import comfy.model_management
@@ -413,7 +412,8 @@ def refine_all_at_once(image, guider, sampler, sigmas, vae, noise, max_tile_widt
             tile_mode, canvas_w, canvas_h, layout.sol_x.n, layout.sol_y.n, len(windows), cap_w * geometry.scale,
             cap_h * geometry.scale, layout.overlap, tile_size)
 
-    latent = sampling.encode_pixels(vae, padded)
+    vae_tile_w, vae_tile_h = cap_w * geometry.scale, cap_h * geometry.scale
+    latent = sampling.encode_canvas(vae, padded, vae_tile_w, vae_tile_h)
     canvas_noise = sampling.build_canvas_noise(vae, noise, canvas_h, canvas_w, batch, batch_size, batch_index,
                                                latent_scale=geometry.scale)
     sampling.check_latent_layout(latent, canvas_noise, canvas_w, canvas_h, geometry.scale, "canvas")
@@ -431,7 +431,7 @@ def refine_all_at_once(image, guider, sampler, sigmas, vae, noise, max_tile_widt
                                          callback=_guarded_callback(guider, sigmas, wrapper, bar, batch_size,
                                                                     batch_index))
     _require_wrapper_used(wrapper)
-    decoded = sampling.decode_canvas(vae, samples)
+    decoded = sampling.decode_canvas(vae, samples, vae_tile_w, vae_tile_h)
     decoded = decoded.to(comfy.model_management.intermediate_device())
     return sampling.crop_image_to(decoded, height, width)
 

@@ -402,8 +402,11 @@ def test_tile_refine_node_all_at_once_end_to_end(comfy_stubs, tile_mode, tile_si
     grid_px = multiple or scale
     expected = vae.decode(vae.encode(sampling.pad_image_to_multiple(image, grid_px)[0]))[:, :600, :744]
     assert torch.allclose(out, expected, atol=1e-6)
-    # The whole canvas is decoded tiled (512 px tiles, 64 px overlap), never in one plain decode.
-    assert vae.tiled_decodes == [(512 // scale, 512 // scale, 64 // scale)]
+    # The whole canvas is encoded and decoded tiled at the window cap (rings included), never plain.
+    [(tw, th, overlap)] = vae.tiled_encodes
+    assert 0 < tw <= 256 and 0 < th <= 256 and tw % scale == 0 and th % scale == 0
+    assert overlap == min(tw, th, 256) // 4
+    assert vae.tiled_decodes == [(tw // scale, th // scale, min(tw // scale, th // scale, 256 // scale) // 4)]
     assert guider.model_options == {}
     assert len(guider.calls) == 1 and guider.calls[0]["seed"] == ZeroNoise.seed
     cap = 256 // scale

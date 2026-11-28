@@ -800,19 +800,34 @@ def fold_decoded_frames(decoded):
     return decoded
 
 
-# Whole-canvas decode for the all-at-once engines, tiled like core's VAEDecodeTiled at its
-# defaults (512 px tiles, 64 px overlap). A plain vae.decode of a multi-megapixel canvas cannot
-# be trusted to raise OOM and trigger core's own tiled retry: under Windows' sysmem fallback the
+# Whole-canvas encode and decode for the all-at-once engines, tiled at the run's own window
+# size (tile_w x tile_h px, rings included: what tile by tile already encodes and decodes in one
+# piece, so the card is known to take it) with a 64 px overlap, as core's VAEEncodeTiled and
+# VAEDecodeTiled default to. A plain vae.encode/decode of a multi-megapixel canvas cannot be
+# trusted to raise OOM and trigger core's own tiled retry: under Windows' sysmem fallback the
 # allocation succeeds in shared memory, and an SDXL 2560x2560 decode then crawls for 10+ minutes.
-DECODE_TILE_PX = 512
-DECODE_OVERLAP_PX = 64
+VAE_OVERLAP_PX = 64
 
 
-def decode_canvas(vae, samples):
+def encode_canvas(vae, pixels, tile_w, tile_h):
+    # encode_tiled takes pixel sizes. Batch rows go one at a time on a video-family VAE, for
+    # the frame-merging reason in encode_pixels (encode_tiled reshapes the batch the same way).
+    overlap = min(tile_w, tile_h, VAE_OVERLAP_PX * 4) // 4
+
+    def encode(rows):
+        return vae.encode_tiled(rows, tile_x=tile_w, tile_y=tile_h, overlap=overlap)
+
+    if getattr(vae, "latent_dim", 2) == 3 and pixels.shape[0] > 1:
+        return torch.cat([encode(pixels[b:b + 1]) for b in range(pixels.shape[0])], dim=0)
+    return encode(pixels)
+
+
+def decode_canvas(vae, samples, tile_w, tile_h):
+    # decode_tiled takes latent sizes.
     compression = vae.spacial_compression_decode()
-    tile = max(1, DECODE_TILE_PX // compression)
-    overlap = min(tile - 1, DECODE_OVERLAP_PX // compression)
-    return fold_decoded_frames(vae.decode_tiled(samples, tile_x=tile, tile_y=tile, overlap=overlap))
+    tile_x, tile_y = max(1, tile_w // compression), max(1, tile_h // compression)
+    overlap = min(tile_x, tile_y, 4 * VAE_OVERLAP_PX // compression) // 4
+    return fold_decoded_frames(vae.decode_tiled(samples, tile_x=tile_x, tile_y=tile_y, overlap=overlap))
 
 
 def _refine_tiles(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor, context_overlap, region_pixel=None, *, hint_canvas=None, batch_size=1, batch_index=0, geometry=EIGHT, tile_size=None, preview_mode=None, bar=None):
