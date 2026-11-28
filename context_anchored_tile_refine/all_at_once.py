@@ -431,7 +431,7 @@ def refine_all_at_once(image, guider, sampler, sigmas, vae, noise, max_tile_widt
                                          callback=_guarded_callback(guider, sigmas, wrapper, bar, batch_size,
                                                                     batch_index))
     _require_wrapper_used(wrapper)
-    decoded = sampling.fold_decoded_frames(vae.decode(samples))
+    decoded = sampling.decode_canvas(vae, samples)
     decoded = decoded.to(comfy.model_management.intermediate_device())
     return sampling.crop_image_to(decoded, height, width)
 

@@ -31,6 +31,7 @@ class ScaleVAE:
         self.latent_channels = channels
         self.require = require or scale
         self.encode_shapes = []
+        self.tiled_decodes = []
 
     def spacial_compression_encode(self):
         return self.scale
@@ -49,6 +50,14 @@ class ScaleVAE:
     def decode(self, samples):
         rgb = samples[:, :3].movedim(1, -1)
         return rgb.repeat_interleave(self.scale, dim=1).repeat_interleave(self.scale, dim=2)
+
+    def spacial_compression_decode(self):
+        return self.scale
+
+    def decode_tiled(self, samples, tile_x=None, tile_y=None, overlap=None):
+        # Position-preserving, so a tiled decode equals the plain one; the bounds are recorded.
+        self.tiled_decodes.append((tile_x, tile_y, overlap))
+        return self.decode(samples)
 
 
 class CheckingGuider(GridGuider):

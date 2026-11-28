@@ -800,6 +800,21 @@ def fold_decoded_frames(decoded):
     return decoded
 
 
+# Whole-canvas decode for the all-at-once engines, tiled like core's VAEDecodeTiled at its
+# defaults (512 px tiles, 64 px overlap). A plain vae.decode of a multi-megapixel canvas cannot
+# be trusted to raise OOM and trigger core's own tiled retry: under Windows' sysmem fallback the
+# allocation succeeds in shared memory, and an SDXL 2560x2560 decode then crawls for 10+ minutes.
+DECODE_TILE_PX = 512
+DECODE_OVERLAP_PX = 64
+
+
+def decode_canvas(vae, samples):
+    compression = vae.spacial_compression_decode()
+    tile = max(1, DECODE_TILE_PX // compression)
+    overlap = min(tile - 1, DECODE_OVERLAP_PX // compression)
+    return fold_decoded_frames(vae.decode_tiled(samples, tile_x=tile, tile_y=tile, overlap=overlap))
+
+
 def _refine_tiles(image, guider, sampler, sigmas, vae, noise, max_tile_width, max_tile_height, context_anchor, context_overlap, region_pixel=None, *, hint_canvas=None, batch_size=1, batch_index=0, geometry=EIGHT, tile_size=None, preview_mode=None, bar=None):
     # Tiled img2img: pad to /8 → solve the grid → encode/sample/decode each tile in
     # raster order from a live canvas → DC-match onto the already-placed neighbors →
